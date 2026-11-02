@@ -1,0 +1,13 @@
+# 测试2：镜像模式 + 会话标记交互（用 --sync-only 跳过启动）
+[general]
+backup_keep = 3
+timeout_launch = 30
+net_wait = 10
+
+[[game]]
+name = '测试'
+exe = ''
+mode = 'mirror'
+sync = [
+  { local = 'C:\Users\HC\.zcode\workspace\c7d3d2f8-915f-4575-870f-7549bedc0c96\云档\test\loc', net = 'C:\Users\HC\.zcode\workspace\c7d3d2f8-915f-4575-870f-7549bedc0c96\云档\test\net' },
+]

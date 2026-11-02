@@ -1,0 +1,14 @@
+# 测试4：已运行检测（explorer.exe 常驻，必然命中）
+[general]
+backup_keep = 3
+timeout_launch = 30
+net_wait = 10
+
+[[game]]
+name = '测试'
+exe = 'C:\Windows\System32\ping.exe'
+process = ['explorer.exe']
+mode = 'timestamp'
+sync = [
+  { local = 'C:\Users\HC\.zcode\workspace\c7d3d2f8-915f-4575-870f-7549bedc0c96\云档\test\loc', net = 'C:\Users\HC\.zcode\workspace\c7d3d2f8-915f-4575-870f-7549bedc0c96\云档\test\net' },
+]
