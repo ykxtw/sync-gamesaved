@@ -1,0 +1,48 @@
+# ============================================================
+#  云档 配置示例 —— 复制为 云档.toml 后修改，或直接运行向导生成
+#  路径用单引号包裹，Windows 反斜杠无需转义：'D:\Games\xxx.exe'
+# ============================================================
+
+[general]
+backup_keep = 10            # 推送前备份保留份数；归档模式下同时是 zip 快照保留份数；0 = 不清理
+timeout_launch = 120        # 等待游戏进程出现的超时秒数
+net_wait = 60               # 网络目录不可达时的等待秒数（期间每 3 秒重试）
+# 游玩统计 云档统计.csv / 日志 云档.log / 封面缓存 covers\ 固定在程序目录下，无需配置
+
+# ---------------- 一个游戏一个 [[game]] 块 ----------------
+
+[[game]]
+name = '星空'
+exe = 'D:\Games\Starfield\Starfield.exe'
+# args = '-fullscreen'                # 可选：启动参数
+# workdir = 'D:\Games\Starfield'      # 可选：工作目录，默认取 exe 所在目录
+process = []                          # 留空 = 自动跟踪启动的进程树（推荐）
+                                      # 启动器行为复杂（常驻托盘/派生进程名特殊）时，
+                                      # 改为显式列出要等待的进程: process = ['Starfield.exe']
+mode = 'timestamp'                    # timestamp=时间戳 / mirror=镜像 / archive=归档(zip快照)
+# backup_keep = 10                    # 可选：单独覆盖本游戏的备份保留份数
+exclude = ['*.tmp', 'shadercache/']   # 排除规则：'*.tmp' 匹配任意层级同名文件；
+                                      # 'shadercache/' 匹配任意层级同名目录
+sync = [
+  { local = 'C:\Users\HC\Documents\My Games\Starfield', net = '\\NAS\games\存档\Starfield' },
+]
+
+[[game]]
+name = '雾锁王国'
+exe = 'D:\Games\Enshrouded\enshrouded_launcher.exe'
+process = ['enshrouded.exe']          # 等待这个进程退出才算结束
+mode = 'mirror'                       # 镜像模式：两端完全一致（有会话标记保护，见 README）
+exclude = ['*.log', 'cache/']
+sync = [
+  { local = 'C:\Users\HC\AppData\Local\Enshrouded', net = '\\NAS\games\存档\Enshrouded' },
+  { local = 'C:\Users\HC\Saved Games\Enshrouded',   net = '\\NAS\games\存档\Enshrouded_存档' },
+]
+
+[[game]]
+name = '空洞骑士（仅归档）'
+exe = 'D:\Games\HollowKnight\HollowKnight.exe'
+mode = 'archive'                      # 归档模式：每次会话打包 zip 存网络端，启动时恢复最新
+backup_keep = 5                       # 保留最近 5 份快照
+sync = [
+  { local = 'C:\Users\HC\AppData\LocalLow\Team Cherry\Hollow Knight', net = '\\NAS\games\存档\HollowKnight' },
+]
