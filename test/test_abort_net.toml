@@ -1,0 +1,12 @@
+[general]
+backup_keep = 3
+timeout_launch = 30
+net_wait = 20
+
+[[game]]
+name = '中止测试'
+exe = ''
+mode = 'timestamp'
+sync = [
+  { local = '/home/z/my-project/sync-gamesaved/test/loc', net = '/home/z/my-project/sync-gamesaved/test/net_missing_abort' },
+]

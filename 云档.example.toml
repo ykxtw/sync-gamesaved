@@ -46,3 +46,10 @@ backup_keep = 5                       # 保留最近 5 份快照
 sync = [
   { local = 'C:\Users\HC\AppData\LocalLow\Team Cherry\Hollow Knight', net = '\\NAS\games\存档\HollowKnight' },
 ]
+
+[[game]]
+name = '双人成行（仅收录）'
+exe = 'D:\Games\ItTakesTwo\ItTakesTwo.exe'
+nosync = true                         # 仅收录：不参与存档同步，只加入游戏库（可启动、统计时长）
+                                      # 无需 sync 目录对；界面里编辑该游戏时“启用存档同步”开关为关闭状态
+sync = []

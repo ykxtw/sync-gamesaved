@@ -1,23 +1,62 @@
 @echo off
 rem ============================================================
-rem  æ„å»ºç‹¬ç«‹ exeï¼šéœ€è¦å·²å®‰è£… Python 3.11+
-rem  äº§ç‰©: dist\äº‘æ¡£.exe     ï¼ˆå›¾å½¢å¯åŠ¨å™¨ï¼ŒåŒå‡»ä½¿ç”¨ï¼‰
-rem        dist\äº‘æ¡£-cli.exe ï¼ˆå‘½ä»¤è¡Œç‰ˆï¼Œä¾›è„šæœ¬/è®¡åˆ’ä»»åŠ¡ï¼‰
+rem  ¹¹½¨¶ÀÁ¢ exe£ºĞèÒªÒÑ°²×° Python 3.11+
+rem  ²úÎï: dist\ÔÆµµ.exe     £¨Í¼ĞÎÆô¶¯Æ÷£¬Ë«»÷Ê¹ÓÃ£©
+rem        dist\ÔÆµµ-cli.exe £¨ÃüÁîĞĞ°æ£¬¹©½Å±¾/¼Æ»®ÈÎÎñ£©
+rem  ×¢Òâ£º±¾ÎÄ¼ş±ØĞë±£´æÎª ANSI/GBK ±àÂë¡£Èô±»±à¼­Æ÷×ª´æÎª UTF-8£¬
+rem        ÖĞÎÄ Windows µÄ cmd »áÂÒÂë²¢±¨"²»ÊÇÄÚ²¿»òÍâ²¿ÃüÁî"£»
+rem        Ò²²»ÒªÔÚÀïÃæ¼Ó chcp 65001£¨»áÈÃ cmd ĞĞ¶¨Î»´íÂÒ£©¡£
 rem ============================================================
-chcp 65001 >nul
+setlocal
 cd /d "%~dp0"
 
-py -m pip install -U psutil customtkinter pillow pyinstaller || goto :err
-py -m PyInstaller -F -w -n äº‘æ¡£ --collect-all customtkinter --clean --noconfirm äº‘æ¡£GUI.py || goto :err
-py -m PyInstaller -F -n äº‘æ¡£-cli --clean --noconfirm äº‘æ¡£.py || goto :err
+if not exist "ÔÆµµGUI.py" goto :nosrc
+if not exist "ÔÆµµ.py" goto :nosrc
+
+rem ---- ¶¨Î» Python£ºÓÅÏÈ py Æô¶¯Æ÷£¬ÕÒ²»µ½ÔÙÊÔ python ----
+set "PY=py"
+%PY% --version >nul 2>nul || set "PY=python"
+%PY% --version >nul 2>nul || goto :nopy
+%PY% -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" || goto :badver
+
+echo [1/3] °²×°ÒÀÀµ£¨Ê×´Î½ÏÂı£»Ö±Á¬Ê§°Ü»á×Ô¶¯»»Çå»ª¾µÏñÖØÊÔ£©...
+%PY% -m pip install -U psutil customtkinter pillow pyinstaller || %PY% -m pip install -U psutil customtkinter pillow pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple || goto :err
+
+echo [2/3] ´ò°üÍ¼ĞÎ°æ dist\ÔÆµµ.exe ...
+%PY% -m PyInstaller -F -w -n ÔÆµµ --collect-all customtkinter --clean --noconfirm ÔÆµµGUI.py || goto :err
+
+echo [3/3] ´ò°üÃüÁîĞĞ°æ dist\ÔÆµµ-cli.exe ...
+%PY% -m PyInstaller -F -n ÔÆµµ-cli --clean --noconfirm ÔÆµµ.py || goto :err
 
 echo.
-echo æ„å»ºå®Œæˆ: dist\äº‘æ¡£.exe  +  dist\äº‘æ¡£-cli.exe
+echo ¹¹½¨Íê³É: dist\ÔÆµµ.exe  +  dist\ÔÆµµ-cli.exe
+echo ÓÃĞÂµÄ exe ¸²¸Ç¾É°æ¼´¿É£»ÔÆµµ.toml ÅäÖÃ/Í³¼Æ/·âÃæÍêÈ«¼æÈİ¡£
 pause
 exit /b 0
 
+:nosrc
+echo.
+echo [´íÎó] µ±Ç°Ä¿Â¼ÕÒ²»µ½ ÔÆµµGUI.py / ÔÆµµ.py¡£
+echo        Èô½âÑ¹Ô´Âë zip ºóÖĞÎÄÎÄ¼şÃû±ä³ÉÁËÂÒÂë£¬ÇëÓÃ Windows ×Ô´ø
+echo        ½âÑ¹¹¦ÄÜ»ò 7-Zip ÖØĞÂ½âÑ¹£¬ÔÙÔËĞĞ±¾½Å±¾¡£
+pause
+exit /b 1
+
+:nopy
+echo.
+echo [´íÎó] Î´ÕÒµ½ Python¡£Çë°²×° Python 3.11+£¬
+echo        °²×°Ê±Îñ±Ø¹´Ñ¡ "Add python.exe to PATH"¡£
+pause
+exit /b 1
+
+:badver
+echo.
+echo [´íÎó] Python °æ±¾¹ıµÍ£¬ÔÆµµĞèÒª 3.11 »ò¸üĞÂ°æ±¾¡£
+pause
+exit /b 1
+
 :err
 echo.
-echo æ„å»ºå¤±è´¥ï¼Œè¯·æ£€æŸ¥ä¸Šæ–¹æŠ¥é”™ã€‚
+echo ¹¹½¨Ê§°Ü£¬Çë¼ì²éÉÏ·½±¨´í¡£
 pause
 exit /b 1

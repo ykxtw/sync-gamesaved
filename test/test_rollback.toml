@@ -1,0 +1,17 @@
+# 云档 配置文件（由向导生成，可手工编辑）
+# mode 可选: timestamp=时间戳 / mirror=镜像 / archive=归档(zip快照)
+
+[general]
+backup_keep = 11   # 推送前备份保留份数（归档模式下同时是 zip 保留份数，0=不清理）
+timeout_launch = 130   # 等待进程出现的超时秒数
+net_wait = 65   # 网络目录不可达时的等待秒数
+
+[[game]]
+name = '甲改'
+id = 'bc6a73721b'   # 隐藏ID（自动生成，统计归属用；请勿修改或删除）
+exe = ''
+mode = 'timestamp'
+backup_keep = 3
+sync = [
+  { local = '/tmp/yd_rb_sai9w4y5/save_a', net = '/tmp/yd_rb_sai9w4y5/net_a' },
+]

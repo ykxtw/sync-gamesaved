@@ -10,7 +10,7 @@ import tempfile
 import time
 from contextlib import redirect_stdout
 
-BASE = r'C:\Users\HC\.zcode\workspace\c7d3d2f8-915f-4575-870f-7549bedc0c96\云档'
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # 自动定位源码根目录
 sys.path.insert(0, BASE)
 import 云档 as engine  # noqa: E402
 
@@ -59,6 +59,7 @@ with redirect_stdout(buf):
 check('1 本机陈旧锁自动接管', ok and not b.asked and read_info(NET)['computer'] == HOST,
       f'ok={ok} asked={len(b.asked)}')
 check('1b 有自动清理提示', '自动清理' in buf.getvalue())
+engine.NetLock(NET).release()   # 真实应用会话结束时必然释放（同时清进程内登记表）
 shutil.rmtree(NET, ignore_errors=True)
 
 # ---- 2) 本机锁但 pid 活着（自己这台正开着另一个云档）→ 询问，选退出 ----
@@ -76,6 +77,7 @@ with redirect_stdout(io.StringIO()):
     ok = engine.NetLock(NET).acquire(b)
 check('3 远端锁强制接管成功', ok and len(b.asked) == 1 and read_info(NET)['computer'] == HOST,
       f'ok={ok}')
+engine.NetLock(NET).release()
 shutil.rmtree(NET, ignore_errors=True)
 
 # ---- 4) SMB 删除失败模拟：rmtree 对锁路径总失败 → 改名让路成功 ----
@@ -102,6 +104,7 @@ try:
     check('4b 有改名让路提示', '改名让路' in buf.getvalue())
 finally:
     shutil.rmtree = real_rmtree
+engine.NetLock(NET).release()   # 恢复真 rmtree 后再释放，清掉登记表
 shutil.rmtree(NET, ignore_errors=True)
 
 # ---- 5) 删除+改名都失败 → 明确报错并退出码语义（acquire=False）----

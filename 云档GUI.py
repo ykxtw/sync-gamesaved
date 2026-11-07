@@ -16,6 +16,7 @@
 """
 
 import argparse
+import copy
 import ctypes
 import hashlib
 import os
@@ -54,6 +55,7 @@ C_RED_H = '#a53b3b'
 C_CARD = '#1b1b1b'
 C_CARD_H = '#262626'
 C_CARD_SEL = '#1f4e79'
+C_CARD_DRAG = '#2a5a8a'   # v2.5.2：拖拽中的卡片（比选中色亮，示意“提起”）
 
 PHASE_LABEL = {
     '预检': '正在预检…', '锁定': '正在获取网络同步锁…', '恢复': '正在恢复：网络 → 本地…',
@@ -66,21 +68,46 @@ PHASE_LABEL = {
 # 桥接：引擎(工作线程) <-> UI(主线程)
 # ----------------------------------------------------------------------------
 class GuiReporter(engine.Reporter):
-    def __init__(self, q):
+    """会话输出 → UI 队列。v2.5.0：每条消息附带会话的游戏ID，
+    多会话并行时 UI 能区分归属（日志前缀/按会话更新状态）。"""
+
+    def __init__(self, q, gid=''):
         self.q = q
+        self.gid = gid
 
     def info(self, msg=''):
         s = str(msg)
         for line in s.splitlines() or ['']:
             engine.LOG.info(line)
-        self.q.put(('log', s))
+        self.q.put(('log', s, self.gid))
 
     def phase(self, name, detail=''):
         engine.LOG.info('[阶段] %s %s', name, detail)
-        self.q.put(('phase', name, detail))
+        self.q.put(('phase', name, detail, self.gid))
 
     def event(self, name, data=None):
-        self.q.put(('event', name, data))
+        self.q.put(('event', name, data, self.gid))
+
+
+class GameSession:
+    """一个进行中的游戏会话（v2.5.0：多游戏可并行，每个游戏一个会话）。
+
+    - gid:         游戏隐藏ID（会话注册表键；同一游戏同时只允许一个会话）
+    - game:        会话期间冻结的游戏配置引用（该游戏在会话结束前禁止编辑/删除）
+    - launch_time: 游戏进程已出现的时刻（None=尚未出现/已退出，处于同步阶段）
+    """
+
+    def __init__(self, gid, name, game, sync_only, direction):
+        self.gid = gid
+        self.name = name
+        self.game = game
+        self.sync_only = sync_only
+        self.direction = direction
+        self.control = engine.SessionControl()
+        self.launch_time = None
+        self.aborting = False      # 已请求中止，等待收尾
+        self.phase = '准备中'       # 最近阶段（状态栏显示用）
+        self.started = time.time()
 
 
 class GuiBridge(engine.UiBridge):
@@ -95,9 +122,12 @@ def to_raw(cfg):
     """把已归一化的配置转回 TOML 原始结构（供校验与保存）"""
     games = []
     for g in cfg['games']:
-        games.append({k: g[k] for k in ('id', 'name', 'exe', 'args', 'workdir', 'process',
-                                        'mode', 'exclude', 'backup_keep', 'cover', 'sync')
-                      if g.get(k) not in (None, '', [])})
+        d = {k: g[k] for k in ('id', 'name', 'exe', 'args', 'workdir', 'process',
+                               'mode', 'exclude', 'backup_keep', 'cover', 'sync', 'launch')
+             if g.get(k) not in (None, '', [])}
+        if g.get('nosync'):
+            d['nosync'] = True
+        games.append(d)
     return {'general': {'backup_keep': cfg['backup_keep'], 'timeout_launch': cfg['timeout_launch'],
                         'net_wait': cfg['net_wait']},
             'game': games}
@@ -308,9 +338,16 @@ class App(ctk.CTk):
         self.startup_error = startup_error
         self.q = queue.Queue()
         self.selected = None
-        self.running = False
-        self.control = None
-        self.launch_time = None
+        # v2.5.0 多会话：{游戏隐藏ID: GameSession}；self.running 为只读属性 = 是否有任一会话
+        self.sessions = {}
+        self._card_badges = {}        # {游戏ID: 卡片右侧运行徽标}（每秒刷新计时）
+        self._cards = []              # v2.5.2：[(卡片, 游戏)]——卡片当前视觉顺序（拖动排序）
+        self._drag = None             # v2.5.2：进行中的拖拽状态（None=无）
+        self._log_tagged = False      # 出现过并行会话后，会话日志加 [游戏名] 前缀
+        self._status_result = ('就绪', '#8fd6a8')   # 无会话时状态栏文案（会话结束后显示结果）
+        self._modal_lock = threading.Lock()        # 串行化多会话的确认弹窗（防同时抢 grab）
+        self._done_names = {}         # {游戏ID: 游戏名}（会话结束后日志前缀兑底）
+        self._last_status = None
         self.smoke_ms = smoke_ms
         self.shot_path = shot_path
 
@@ -335,6 +372,11 @@ class App(ctk.CTk):
         self._close_dlg = None     # 当前打开的关闭警告窗（防重入）
         self.protocol('WM_DELETE_WINDOW', self.on_close)
         self.after(80, self._poll)
+        # v2.5.2 拖动排序：主窗口级事件（子控件事件经 bindtag 冒泡到根；
+        # 编辑器/统计等对话框是独立 Toplevel，不会触发这里的绑定）
+        self.bind('<Button-1>', self._root_button1)
+        self.bind('<B1-Motion>', self._on_card_drag)
+        self.bind('<ButtonRelease-1>', self._on_card_drop)
 
         if startup_error:
             self.after(300, lambda: messagebox.showerror('配置错误', startup_error, parent=self))
@@ -342,6 +384,11 @@ class App(ctk.CTk):
             if shot_path:
                 self.after(max(300, smoke_ms - 900), self._take_shot)
             self.after(smoke_ms, self.destroy)
+
+    @property
+    def running(self):
+        """是否有会话进行中（任一游戏）。旧接口保留：只读判断用。"""
+        return bool(self.sessions)
 
     # ---------------- 界面搭建 ----------------
     def _show_centered(self):
@@ -455,8 +502,11 @@ class App(ctk.CTk):
         self._refresh_detail()
 
     def _refresh_cards(self):
+        self._drag = None            # v2.5.2：卡片重建即作废进行中的拖拽
         for w in self.cards_frame.winfo_children():
             w.destroy()
+        self._card_badges = {}
+        self._cards = []             # v2.5.2：记录卡片→游戏的当前视觉顺序
         games = self.cfg['games'] if self.cfg else []
         for i, g in enumerate(games):
             total, week = (0.0, 0.0)
@@ -470,27 +520,42 @@ class App(ctk.CTk):
                                 fg_color=C_CARD_SEL if sel else C_CARD)
             card.pack(fill='x', pady=3)
             card.pack_propagate(False)
+            # v2.5.0：会话运行中 → 卡片右侧徽标（计时由 _update_card_badges 每秒刷新）
+            # 注意：徽标必须先于两行文字 pack（side='right' 先占右缘），
+            # 否则会落到文字下方的残余空腔里被 72px 固定高裁掉（不可见）
+            gid = str(g.get('id') or '')
+            badge = None
+            if gid in self.sessions:
+                badge = ctk.CTkLabel(card, text='同步中', width=64, anchor='e',
+                                     font=ctk.CTkFont(FONT, 11, 'bold'), text_color='#e0b050')
+                badge.pack(side='right', padx=10, pady=(9, 0))
+                self._card_badges[gid] = badge
             lbl_t = ctk.CTkLabel(card, text=g['name'], anchor='w', justify='left',
                                  font=ctk.CTkFont(FONT, 16, 'bold'))
             lbl_t.pack(anchor='w', padx=12, pady=(9, 0))
-            sub = f"{MODE_LABELS.get(g['mode'], g['mode'])} · 累计 {fmt_hours(total)} · 本周 {fmt_hours(week)}"
+            mode_txt = '不同步' if g.get('nosync') else MODE_LABELS.get(g['mode'], g['mode'])
+            sub = f"{mode_txt} · 累计 {fmt_hours(total)} · 本周 {fmt_hours(week)}"
             lbl_s = ctk.CTkLabel(card, text=sub, anchor='w', justify='left',
                                  text_color='#9a9a9a', font=ctk.CTkFont(FONT, 11))
             lbl_s.pack(anchor='w', padx=12, pady=(1, 8))
-            normal = C_CARD_SEL if sel else C_CARD
-            hover = C_CARD_SEL if sel else C_CARD_H
+            self._cards.append((card, g))
 
-            def _click(e, i=i):
-                self.select_game(i)
+            # v2.5.2：按下即“轻量选中”（只换底色与详情，不重建卡片——重建会
+            # 销毁拖拽中的控件）；松开时无位移=点击选中，有位移=拖动排序。
+            # 悬停色按当前选中态动态计算（选中态在按下时变更，不再固结于构建时）
+            def _press(e, i=i, c=card):
+                self._card_press(i, c, e)
 
-            def _enter(e, c=card, h=hover):
-                c.configure(fg_color=h)
+            def _enter(e, c=card, i=i):
+                if self._drag and self._drag.get('moved'):
+                    return
+                c.configure(fg_color=C_CARD_SEL if i == self.selected else C_CARD_H)
 
-            def _leave(e, c=card, n=normal):
-                c.configure(fg_color=n)
+            def _leave(e, c=card, i=i):
+                c.configure(fg_color=C_CARD_SEL if i == self.selected else C_CARD)
 
-            for wgt in (card, lbl_t, lbl_s):
-                wgt.bind('<Button-1>', _click)
+            for wgt in (card, lbl_t, lbl_s) + ((badge,) if badge is not None else ()):
+                wgt.bind('<Button-1>', _press)
                 wgt.bind('<Enter>', _enter)
                 wgt.bind('<Leave>', _leave)
 
@@ -503,16 +568,23 @@ class App(ctk.CTk):
             return
         g = games[self.selected]
         self.lbl_name.configure(text=g['name'])
-        pairs = '\n'.join(f"· {short(p['local'])}  ↔  {short(p['net'])}" for p in g['sync']) or '（未配置目录对）'
-        excl = '、'.join(g['exclude']) or '无'
-        proc = '自动跟踪进程树' if not g['process'] else '、'.join(g['process'])
         exe = short(g['exe']) if g['exe'] else '（仅同步）'
-        meta = (f"模式：{MODE_LABELS.get(g['mode'], g['mode'])}    备份保留：{g['backup_keep']} 份    等待：{proc}\n"
-                f"程序：{exe}\n"
-                f"目录对：\n{pairs}\n"
-                f"排除：{excl}")
+        proc = '自动跟踪进程树' if not g['process'] else '、'.join(g['process'])
+        lmode = 'Shell（等价双击）' if g.get('launch') == 'shell' else '直接'
+        if g.get('nosync'):
+            meta = (f"模式：不同步（仅收录进游戏库，不做存档同步）    等待：{proc}    启动：{lmode}\n"
+                    f"程序：{exe}\n"
+                    f"目录对：未启用存档同步")
+        else:
+            pairs = '\n'.join(f"· {short(p['local'])}  ↔  {short(p['net'])}" for p in g['sync']) or '（未配置目录对）'
+            excl = '、'.join(g['exclude']) or '无'
+            meta = (f"模式：{MODE_LABELS.get(g['mode'], g['mode'])}    备份保留：{g['backup_keep']} 份    等待：{proc}    启动：{lmode}\n"
+                    f"程序：{exe}\n"
+                    f"目录对：\n{pairs}\n"
+                    f"排除：{excl}")
         self.lbl_meta.configure(text=meta, text_color='#b8b8b8', wraplength=640, justify='left')
         self._set_cover(g.get('cover'))
+        self._apply_action_states()
 
     def _set_cover(self, path):
         """重建封面标签——CTkLabel 的 image=None 不会清除已显示图像，销毁重建才彻底"""
@@ -538,12 +610,205 @@ class App(ctk.CTk):
         return (self.cfg is not None and self.selected is not None
                 and 0 <= self.selected < len(self.cfg['games']))
 
+    def _selection_nosync(self):
+        """当前选中游戏是否为“仅收录（不同步）”"""
+        if not self._has_selection():
+            return False
+        return bool(self.cfg['games'][self.selected].get('nosync'))
+
+    def _apply_action_states(self, running=None):
+        """刷新操作按钮可用性（v2.5.0：按“所选游戏”粒度）。
+
+        会话只锁定它自己的那个游戏：其他游戏仍可启动/编辑/删除（并行会话）；
+        “仅收录”游戏额外禁用 仅下载/仅上传/打开存档目录（无同步目录可用）。
+        「提前结束并同步」「中止会话」作用于所选游戏的会话，无会话时隐藏。"""
+        sess = self._selected_session()
+        if sess is not None:
+            self.btn_play.configure(state='disabled', text='▶ 运行中…')
+        else:
+            self.btn_play.configure(state='normal', text='▶ 开始游戏')
+        nosync = self._selection_nosync()
+        sync_state = 'disabled' if (sess is not None or nosync) else 'normal'
+        for b in (self.btn_down, self.btn_up, self.btn_opendir):
+            b.configure(state=sync_state)
+        for b in (self.btn_edit, self.btn_del):
+            b.configure(state='disabled' if sess is not None else 'normal')
+        self.btn_add.configure(state='normal')
+        if sess is not None:
+            self.btn_stopwait.pack(side='right', padx=4)
+            self.btn_abort.pack(side='right')
+            st = 'disabled' if sess.aborting else 'normal'
+            self.btn_stopwait.configure(state=st)
+            self.btn_abort.configure(state=st)
+        else:
+            self.btn_stopwait.pack_forget()
+            self.btn_abort.pack_forget()
+
+    def _selected_session(self):
+        """当前选中游戏的进行中会话（无则 None）。"""
+        if not self._has_selection():
+            return None
+        return self.sessions.get(str(self.cfg['games'][self.selected].get('id') or ''))
+
+    def _local_dir_conflict(self, game):
+        """其他进行中会话是否与该游戏共用本地存档目录（并行恢复/推送会互相踩踏）。"""
+        mine = set()
+        for p in (game.get('sync') or []):
+            if p.get('local'):
+                mine.add(os.path.normcase(os.path.normpath(p['local'])))
+        if not mine:
+            return None
+        for sess in self.sessions.values():
+            for p in (sess.game.get('sync') or []):
+                if p.get('local') and os.path.normcase(os.path.normpath(p['local'])) in mine:
+                    return sess
+        return None
+
     def select_game(self, i):
-        if self.running:
-            return
+        # v2.5.0：会话期间可自由切换选中（便于查看/中止某个正在运行的游戏）
         self.selected = i
         self._refresh_cards()
         self._refresh_detail()
+
+    # ---------------- 拖动排序（v2.5.2） ----------------
+    def _card_press(self, i, card, e):
+        """卡片按下：记录拖拽起点 + 轻量选中。不重建卡片（否则按下瞬间控件被
+        销毁，拖拽无从发生），只更新底色与右侧详情。"""
+        self._drag = {'card': card, 'idx': i, 'y0': e.y_root, 'moved': False,
+                      'ptr': (e.x_root, e.y_root), 'fresh': True}
+        if self.selected != i:
+            self.selected = i
+            for c, _g in self._cards:
+                try:
+                    c.configure(fg_color=C_CARD_SEL if c is card else C_CARD)
+                except Exception:
+                    pass
+            self._refresh_detail()
+
+    def _root_button1(self, e):
+        """主窗口级按下兜底：若遗留了非卡片按下的拖拽状态（松开发生在窗口外
+        等极端情形未触发 Release），作废之，防止之后拖按钮/日志框误续旧拖拽。"""
+        d = self._drag
+        if d is not None and not d.get('fresh'):
+            self._drag = None
+
+    def _on_card_drag(self, e):
+        """按住左键移动：越过目标卡片中线即实时换位（pack before/after 重排）。
+        坐标一律用屏幕系（x_root/y_root）——隐式抓取下事件仍投递到最初按下的
+        子控件，但 x_root 始终是真实指针位置。"""
+        d = self._drag
+        if d is None:
+            return
+        if not d['card'].winfo_exists():     # 会话事件触发卡片重建：拖拽作废
+            self._drag = None
+            return
+        d['ptr'] = (e.x_root, e.y_root)
+        if not d['moved']:
+            if abs(e.y_root - d['y0']) < 6:   # 位移小于阈值：仍视为点击
+                return
+            d['moved'] = True
+            try:
+                self.configure(cursor='fleur')
+            except Exception:
+                pass
+            try:
+                d['card'].configure(fg_color=C_CARD_DRAG)   # “提起”态：亮于选中色
+            except Exception:
+                pass
+            self._autoscroll_tick()           # 拖到列表上/下缘时自动滚动
+        target = self._card_at(e.x_root, e.y_root)
+        if target is None or target is d['card']:
+            return
+        before = e.y_root < target.winfo_rooty() + target.winfo_height() / 2
+        recs = self._cards
+        di = next(k for k, (c, _g) in enumerate(recs) if c is d['card'])
+        ti = next(k for k, (c, _g) in enumerate(recs) if c is target)
+        rec = recs.pop(di)
+        ti = ti - 1 if ti > di else ti        # 弹出后目标下标回移
+        recs.insert(ti if before else ti + 1, rec)
+        try:
+            if before:
+                d['card'].pack(fill='x', pady=3, before=target)
+            else:
+                d['card'].pack(fill='x', pady=3, after=target)
+        except tk.TclError:
+            pass
+
+    def _card_at(self, x, y):
+        """指针所在卡片（None=卡片区外/卡片间隙）。从真实控件树向上回溯，
+        CTk 控件内部的 canvas/label 也能归到所属卡片。"""
+        try:
+            w = self.winfo_containing(x, y)
+        except Exception:
+            return None
+        for _ in range(10):
+            if w is None or not w or w is self:
+                return None
+            for c, _g in self._cards:
+                if w is c:
+                    return c
+            if w is self.cards_frame:
+                return None
+            try:
+                w = self.nametowidget(w.winfo_parent())
+            except Exception:
+                return None
+        return None
+
+    def _autoscroll_tick(self):
+        """拖拽悬停列表上/下缘时滚动（80ms 一拍；松手/拖拽作废自动停）。"""
+        d = self._drag
+        if d is None or not d.get('moved'):
+            return
+        cv = getattr(self.sidebar, '_parent_canvas', None)
+        if cv is not None:
+            y = d.get('ptr', (0, 0))[1]
+            top, hgt = cv.winfo_rooty(), cv.winfo_height()
+            try:
+                if y < top + 34:
+                    cv.yview_scroll(-1, 'units')
+                elif y > top + hgt - 34:
+                    cv.yview_scroll(1, 'units')
+            except Exception:
+                pass
+        self.after(80, self._autoscroll_tick)
+
+    def _on_card_drop(self, e):
+        """松开：无位移=点击（选中已在按下时完成）；有位移=视觉顺序落盘
+        云档.toml，选中跟随被拖动的游戏，运行中的会话不受影响（按游戏ID索引）。"""
+        d = self._drag
+        self._drag = None
+        if d is None:
+            return
+        try:
+            self.configure(cursor='')
+        except Exception:
+            pass
+        if not d.get('moved'):
+            return
+        if not (self.cfg and self._cards):
+            self.refresh_all()
+            return
+        old = self.cfg['games']
+        new = [g for _c, g in self._cards]
+        if new == old:
+            try:                              # 拖了又放回原位：只复位拖拽色，不重建
+                if d['card'].winfo_exists():
+                    d['card'].configure(fg_color=C_CARD_SEL)
+            except Exception:
+                pass
+            return
+        sel_game = old[self.selected] if (self.selected is not None
+                                          and 0 <= self.selected < len(old)) else None
+        self.cfg['games'] = new
+        if sel_game is not None:               # 选中跟随被拖动的游戏
+            for k, g in enumerate(new):
+                if g is sel_game:
+                    self.selected = k
+                    break
+        if self._save_cfg():
+            self._log_line(f'↕ 已保存新的游戏排序（{len(new)} 个游戏）')
+        self.refresh_all()
 
     # ---------------- 配置操作 ----------------
     def _save_cfg(self):
@@ -565,9 +830,12 @@ class App(ctk.CTk):
             return False
 
     def apply_game(self, game_dict, index):
-        """编辑/新增保存入口（由编辑器对话框调用）。返回 True 表示已应用。"""
+        """编辑/新增保存入口（由编辑器对话框调用）。返回 True 表示已应用。
+        校验或写盘失败时整体回滚内存配置：旧版会把非法游戏残留在内存里，
+        之后任何保存/全局设置操作都会反复校验失败，只能重启恢复。"""
         if not self._ensure_cfg():
             return False
+        snapshot = copy.deepcopy(self.cfg)
         games = self.cfg['games']
         if index is None:
             games.append(game_dict)
@@ -577,23 +845,20 @@ class App(ctk.CTk):
                 game_dict['id'] = games[index].get('id', '')
             games[index] = game_dict
         engine.ensure_game_ids(self.cfg)   # 新增游戏补发隐藏ID
-        if not self._validate_and_normalize():
-            if index is None:
-                games.pop()
+        if not self._validate_and_normalize() or not self._save_cfg():
+            self.cfg = snapshot          # 失败回滚：内存与磁盘保持一致
             return False
-        if not self._save_cfg():
-            return False
-        self.selected = len(games) - 1 if index is None else index
+        self.selected = len(self.cfg['games']) - 1 if index is None else index
         self.refresh_all()
         return True
 
     def apply_general(self, backup_keep, timeout_launch, net_wait):
+        snapshot = copy.deepcopy(self.cfg)
         self.cfg['backup_keep'] = backup_keep
         self.cfg['timeout_launch'] = timeout_launch
         self.cfg['net_wait'] = net_wait
-        if not self._validate_and_normalize():
-            return False
-        if not self._save_cfg():
+        if not self._validate_and_normalize() or not self._save_cfg():
+            self.cfg = snapshot          # 失败回滚（同 apply_game）
             return False
         self._refresh_cards()
         return True
@@ -605,30 +870,42 @@ class App(ctk.CTk):
 
     # ---------------- 事件：配置 ----------------
     def on_add_game(self):
-        if self.running:
-            return
-        GameEditor(self, None)
+        GameEditor(self, None)   # 添加不受会话影响（新游戏与现有会话无冲突）
 
     def on_edit_game(self):
-        if self.running or not self._has_selection():
+        if not self._has_selection():
+            return
+        if self._selected_session() is not None:
+            messagebox.showinfo('提示', '该游戏正在会话中，\n请先中止或等它结束再编辑。', parent=self)
             return
         GameEditor(self, self.selected)
 
     def on_del_game(self):
-        if self.running or not self._has_selection():
+        if not self._has_selection():
+            return
+        if self._selected_session() is not None:
+            messagebox.showinfo('提示', '该游戏正在会话中，\n请先中止或等它结束再删除。', parent=self)
             return
         g = self.cfg['games'][self.selected]
-        if not messagebox.askyesno('删除游戏', f"确定删除「{g['name']}」的配置？\n（网络端存档与备份不会被删除）", parent=self):
+        if not self.ask_confirm('删除游戏', f"确定删除「{g['name']}」的配置？\n（网络端存档与备份不会被删除）",
+                                yes='删除', danger=True):
             return
+        snapshot = copy.deepcopy(self.cfg)
         self.cfg['games'].pop(self.selected)
-        if self._save_cfg():
-            self.selected = None
-            self.refresh_all()
+        if not self._save_cfg():
+            self.cfg = snapshot   # 写盘失败回滚：内存与磁盘保持一致
+            return
+        self.selected = None
+        self.refresh_all()
 
     def on_open_dir(self):
         if not self._has_selection():
             return
-        loc = self.cfg['games'][self.selected]['sync'][0]['local']
+        sync = self.cfg['games'][self.selected]['sync']
+        if not sync:
+            messagebox.showinfo('提示', '该游戏未启用存档同步，没有本地存档目录。', parent=self)
+            return
+        loc = sync[0]['local']
         try:
             os.startfile(loc)
         except OSError as e:
@@ -636,7 +913,9 @@ class App(ctk.CTk):
 
     # ---------------- 事件：会话 ----------------
     def on_close(self):
-        """关闭窗口：会话进行中先弹深色警告（游戏运行中三选/同步中二选）"""
+        """关闭窗口：有会话进行中先弹深色警告（游戏运行中三选/同步中二选）。
+        v2.5.0：多个会话时任一游戏在运行即按“游戏运行中”处理；
+        强制退出=中止全部会话，最小化=全部继续。"""
         if self._pending_close:
             # 已确认过“强制退出”，正在等会话收尾（或 8 秒兜底）：
             # 此时再点 X 不应重复弹确认框，直接销毁窗口
@@ -647,10 +926,11 @@ class App(ctk.CTk):
             return
         if self._close_dlg is not None and self._close_dlg.winfo_exists():
             return   # 警告窗已在前台（任务栏关闭等旁路触发），忽略重复请求
-        if not self.running:
+        if not self.sessions:
             self.destroy()
             return
-        if self.launch_time:
+        game_running = any(s.launch_time is not None for s in self.sessions.values())
+        if game_running:
             ans = self._ask_close_choice('game')
             if ans is None:
                 return
@@ -670,7 +950,7 @@ class App(ctk.CTk):
             self._close_dlg = dlg
             # 兜底看门狗：万一警告窗被隐藏竞态卡住（grab 未生效且不可见），
             # 1.5 秒后自动取消，避免 wait_window 无限挂起导致程序假死
-            self.after(1500, lambda d=dlg: self._close_dlg_watchdog(d))
+            self.after(1500, lambda d=dlg: self._dialog_watchdog(d))
             self.wait_window(dlg)
             return dlg.result
         except Exception:
@@ -679,23 +959,25 @@ class App(ctk.CTk):
         finally:
             self._close_dlg = None
 
-    def _close_dlg_watchdog(self, dlg):
-        """只盯住创建时传入的那个警告窗，不误伤后续新弹窗"""
+    def _dialog_watchdog(self, dlg):
+        """只盯住创建时传入的那个对话框，不误伤后续新弹窗"""
         if dlg is not None and dlg.winfo_exists():
             try:
                 if dlg.state() in ('withdrawn', 'iconic'):
-                    engine.LOG.warning('关闭警告窗未正常显示，自动按“取消”处理')
+                    engine.LOG.warning('对话框未正常显示，自动按“取消”处理')
                     dlg.destroy()
             except Exception:
                 pass
 
     def _force_close(self):
-        """中止会话并等待其干净退出（释放锁/标记）后关闭；8 秒兜底强退"""
-        if self.control is not None:
-            self.control.abort.set()
+        """中止全部会话并等它们干净退出（释放锁/标记）后关闭；8 秒兜底强退"""
+        for sess in self.sessions.values():
+            sess.control.abort.set()
+            sess.aborting = True
         self._pending_close = True
         self.btn_stopwait.configure(state='disabled')
         self.btn_abort.configure(state='disabled')
+        self._last_status = None
         self.lbl_status.configure(text='正在中止…', text_color='#e0b050')
         self.after(8000, self._destroy_if_pending)
 
@@ -707,104 +989,210 @@ class App(ctk.CTk):
                 pass
 
     def start_session(self, sync_only, direction='both'):
-        if self.running or not self._has_selection():
-            if not self._has_selection():
-                messagebox.showinfo('提示', '请先选择一个游戏。', parent=self)
+        """启动一个会话（v2.5.0：每个游戏各自独立，可与其他游戏并行）。
+
+        拒绝三种情况：该游戏已在会话中；“仅收录”游戏做纯同步；
+        与进行中会话共用本地存档目录（并行同步会互相踩踏）。"""
+        if not self._has_selection():
+            messagebox.showinfo('提示', '请先选择一个游戏。', parent=self)
             return
         game = self.cfg['games'][self.selected]
-        self.running = True
-        self.launch_time = None
-        self.control = engine.SessionControl()
-        self._set_running_ui(True)
+        gid = str(game.get('id') or '')
+        if gid in self.sessions:
+            messagebox.showinfo('提示', f'「{game["name"]}」已在会话中，\n等它结束或选中后中止即可。', parent=self)
+            return
+        if game.get('nosync') and sync_only:
+            messagebox.showinfo('提示', '该游戏未启用存档同步（仅收录）。\n如需同步存档，请在“编辑”中开启存档同步。', parent=self)
+            return
+        other = self._local_dir_conflict(game)
+        if other is not None:
+            messagebox.showwarning(
+                '目录冲突',
+                f'「{game["name"]}」与正在运行的「{other.name}」\n'
+                '使用了同一个本地存档目录，不能同时同步。\n'
+                f'请等「{other.name}」结束，或先中止它。', parent=self)
+            return
+        sess = GameSession(gid, game['name'], game, sync_only, direction)
+        self.sessions[gid] = sess
+        if len(self.sessions) >= 2:
+            self._log_tagged = True      # 并行会话 → 日志按游戏名区分
+        self._status_result = None
+        self._last_status = None
         self._log_line('')
         self._log_line('─' * 56)
+        label = '仅恢复（下载）' if direction == 'down' else ('仅推送（上传）' if direction == 'up' else '开始游戏')
+        self._log_line(f'◆ 会话开始：{game["name"]}（{label}）')
         q = self.q
-        bridge, control = GuiBridge(self), self.control
+        bridge, control = GuiBridge(self), sess.control
 
         def work():
             code = engine.EXIT_OK
             try:
                 code = engine.run_session(self.cfg, game, dry_run=False, sync_only=sync_only,
                                           direction=direction, bridge=bridge, control=control,
-                                          reporter=GuiReporter(q))
+                                          reporter=GuiReporter(q, gid))
             except engine.SessionError as e:
                 engine.LOG.warning('会话中止: %s', e.msg)
-                q.put(('log', f'[错误] {e.msg}'))
+                q.put(('log', f'[错误] {e.msg}', gid))
                 code = e.code
             except Exception:
                 engine.LOG.exception('未预期的异常')
-                q.put(('log', '[异常] ' + (traceback.format_exc().splitlines()[-1] or '')))
+                q.put(('log', '[异常] ' + (traceback.format_exc().splitlines()[-1] or ''), gid))
                 code = engine.EXIT_UNEXPECTED
             finally:
-                q.put(('done', code))
+                q.put(('done', code, gid))
 
         threading.Thread(target=work, daemon=True).start()
+        self._refresh_cards()          # 卡片立即显示运行徽标
+        self._apply_action_states()
+        self._refresh_status()
 
     def on_stop_wait(self):
-        if self.control is not None:
-            self.control.stop_wait.set()
+        """提前结束等待：作用于当前选中游戏的会话。"""
+        sess = self._selected_session()
+        if sess is not None:
+            sess.control.stop_wait.set()
 
     def on_abort(self):
-        if self.control is None:
+        """中止会话（当前选中的游戏）：确认后置位该会话的中止信号并给出即时反馈。
+        引擎侧所有等待点（预检网络重试/等进程/robocopy 重试）都会即时响应，
+        不再需要等满超时。其他游戏的会话不受影响。"""
+        sess = self._selected_session()
+        if sess is None or sess.aborting:
             return
-        if messagebox.askyesno('中止会话', '确定中止？本次不会推送存档到网络，\n下次运行会按“未正常结束”处理。',
-                               parent=self):
-            self.control.abort.set()
+        if not self._confirm_abort(sess.name):
+            return
+        if sess.gid not in self.sessions:   # 确认期间会话已自然结束
+            return
+        sess.control.abort.set()
+        sess.aborting = True
+        self._apply_action_states()
+        self._last_status = None
+        self._refresh_status()
 
-    def _set_running_ui(self, running):
-        state = 'disabled' if running else 'normal'
-        for b in (self.btn_play, self.btn_down, self.btn_up, self.btn_edit, self.btn_del,
-                  self.btn_add, self.btn_opendir):
-            b.configure(state=state)
-        if running:
-            self.btn_stopwait.pack(side='right', padx=4)
-            self.btn_abort.pack(side='right')
-        else:
-            self.btn_stopwait.pack_forget()
-            self.btn_abort.pack_forget()
-        self.lbl_status.configure(text='准备中…' if running else '就绪',
-                                  text_color='#e0b050' if running else '#8fd6a8')
+    def _confirm_abort(self, name):
+        return self.ask_confirm(
+            '中止会话', f'确定中止「{name}」的会话？本次不会推送\n存档到网络，下次运行会按“未正常结束”处理。',
+            yes='中止', danger=True)
 
     # ---------------- 轮询队列 ----------------
     def _poll(self):
+        """轮询工作线程事件。队列条目均以游戏ID结尾：
+        ('log', 文本, gid) / ('phase', 阶段, 细节, gid) /
+        ('event', 名称, 数据, gid) / ('done', 退出码, gid)"""
         try:
             while True:
                 item = self.q.get_nowait()
                 kind = item[0]
+                gid = item[-1] if len(item) > 2 else None
                 if kind == 'log':
-                    self._log_line(item[1])
+                    s = item[1]
+                    if self._log_tagged and gid:
+                        sess = self.sessions.get(gid)
+                        name = sess.name if sess is not None else self._done_names.get(gid, '')
+                        if name:
+                            s = '\n'.join(f'[{name}] {ln}' for ln in s.splitlines())
+                    self._log_line(s)
                 elif kind == 'phase':
-                    self.lbl_status.configure(text=PHASE_LABEL.get(item[1], item[1]) +
-                                              (f'（{item[2]}）' if item[2] else ''))
+                    sess = self.sessions.get(gid)
+                    if sess is not None:
+                        sess.phase = item[1]
+                    self._last_status = None
                 elif kind == 'event' and item[1] == 'launched':
-                    self.launch_time = time.time()
+                    sess = self.sessions.get(gid)
+                    if sess is not None:
+                        sess.launch_time = time.time()
+                    self._refresh_cards()
                 elif kind == 'event' and item[1] == 'exited':
-                    self.launch_time = None
+                    sess = self.sessions.get(gid)
+                    if sess is not None:
+                        sess.launch_time = None
+                    self._refresh_cards()
                 elif kind == 'done':
                     code = item[1]
-                    self.running = False
-                    self.launch_time = None
-                    ok = (code == engine.EXIT_OK)
-                    self._set_running_ui(False)
-                    if self._pending_close:
-                        self.destroy()          # 强制关闭流程：会话已干净退出
-                        return
-                    if self.state() == 'iconic':
-                        self.deiconify()        # 最小化等待的场景：完成后还原窗口
-                        self.lift()
-                    self.lbl_status.configure(
-                        text=('✔ 完成' if ok else f'✘ 结束（退出码 {code}）'),
-                        text_color='#8fd6a8' if ok else '#e08080')
+                    sess = self.sessions.pop(gid, None)
+                    if sess is not None:
+                        self._done_names[gid] = sess.name
                     self._refresh_cards()
-                    if ok:
+                    if not self.sessions:
+                        # 全部会话结束
+                        if self._pending_close:
+                            self.destroy()      # 强制关闭流程：会话已干净退出
+                            return
+                        if self.state() == 'iconic':
+                            self.deiconify()    # 最小化等待的场景：完成后还原窗口
+                            self.lift()
+                        if sess is not None:
+                            ok = (code == engine.EXIT_OK)
+                            if ok:
+                                self._status_result = ('✔ 完成', '#8fd6a8')
+                            elif code == engine.EXIT_ABORT:
+                                self._status_result = ('✘ 已中止（本次未推送）', '#e0b050')
+                            else:
+                                self._status_result = (f'✘ 结束（退出码 {code}）', '#e08080')
+                            self._log_line('')
+                            self._log_line(f'✔ 「{sess.name}」会话完成' if ok
+                                           else f'✘ 「{sess.name}」{self._status_result[0]}')
+                    elif sess is not None:
                         self._log_line('')
-                        self._log_line('✔ 会话完成')
+                        self._log_line(f'◇ 「{sess.name}」会话结束，还有 {len(self.sessions)} 个会话运行中')
+                    self._apply_action_states()   # 所选游戏的会话可能刚结束
+                    self._last_status = None
         except queue.Empty:
             pass
-        if self.launch_time:
-            secs = int(time.time() - self.launch_time)
-            self.lbl_status.configure(text=f'游戏运行中 · 已 {secs // 60:02d}:{secs % 60:02d}')
+        self._refresh_status()
+        self._update_card_badges()
         self.after(80, self._poll)
+
+    def _refresh_status(self):
+        """状态栏聚合显示：0=结果/就绪；1=该会话实时状态；多=数量+名单。"""
+        try:
+            n = len(self.sessions)
+            if n == 1:
+                sess = next(iter(self.sessions.values()))
+                if sess.aborting:
+                    text, color = '正在中止…', '#e0b050'
+                elif sess.launch_time:
+                    secs = int(time.time() - sess.launch_time)
+                    text, color = f'游戏运行中 · 已 {secs // 60:02d}:{secs % 60:02d}', '#e0b050'
+                else:
+                    text, color = PHASE_LABEL.get(sess.phase, sess.phase), '#e0b050'
+            elif n > 1:
+                names = '、'.join(s.name for s in self.sessions.values())
+                if len(names) > 20:
+                    names = names[:20] + '…'
+                aborting = sum(1 for s in self.sessions.values() if s.aborting)
+                text = f'正在中止…（{aborting}/{n}）' if aborting else f'{n} 个会话运行中：{names}'
+                color = '#e0b050'
+            else:
+                text, color = self._status_result or ('就绪', '#8fd6a8')
+            if text != self._last_status:
+                self.lbl_status.configure(text=text, text_color=color)
+                self._last_status = text
+        except Exception:
+            pass
+
+    def _update_card_badges(self):
+        """卡片右侧运行徽标：运行时长 / 同步中 / 中止中（文本变化时刷新）。"""
+        for gid, badge in list(self._card_badges.items()):
+            sess = self.sessions.get(gid)
+            if sess is None:
+                continue
+            try:
+                if not badge.winfo_exists():
+                    self._card_badges.pop(gid, None)
+                    continue
+                if sess.aborting:
+                    text, color = '中止中…', '#e0b050'
+                elif sess.launch_time:
+                    secs = int(time.time() - sess.launch_time)
+                    text, color = f'▶ {secs // 60:02d}:{secs % 60:02d}', '#8fd6a8'
+                else:
+                    text, color = '同步中', '#e0b050'
+                if badge.cget('text') != text:
+                    badge.configure(text=text, text_color=color)
+            except Exception:
+                pass
 
     # ---------------- 日志/弹窗/杂项 ----------------
     def _log_line(self, s):
@@ -852,9 +1240,24 @@ class App(ctk.CTk):
             except Exception:
                 ev.set()
 
-        self.after(0, show)
-        ev.wait()
+        with self._modal_lock:   # v2.5.0：多会话确认弹窗串行化，防同时抢 grab
+            self.after(0, show)
+            ev.wait()
         return holder['idx']
+
+    def ask_confirm(self, title, message, yes='确定', no='取消', danger=True):
+        """主线程深色确认框（与主界面风格一致，替代系统 messagebox.askyesno）。
+        返回 True=确认 / False=取消。"""
+        dlg = None
+        try:
+            dlg = ConfirmDialog(self, title, message, yes=yes, no=no, danger=danger)
+            # 兜底看门狗：万一对话框被隐藏竞态卡住，1.5 秒后自动取消
+            self.after(1500, lambda d=dlg: self._dialog_watchdog(d))
+            self.wait_window(dlg)
+            return bool(dlg.result)
+        except Exception:
+            engine.LOG.exception('确认窗口异常，按“取消”处理')
+            return False
 
     def show_stats(self):
         StatsDialog(self)
@@ -886,8 +1289,94 @@ class App(ctk.CTk):
 
 
 # ----------------------------------------------------------------------------
-# 对话框：关闭警告 / 游戏编辑器 / 全局设置 / 统计
+# 对话框：关闭警告 / 通用确认 / 游戏编辑器 / 全局设置 / 统计
 # ----------------------------------------------------------------------------
+def warn_icon(parent):
+    """琥珀色圆形警示图标（Canvas 绘制，与“正在中止…”状态色一致，不依赖符号字体）"""
+    try:
+        scale = parent._get_window_scaling()
+    except Exception:
+        scale = 1.0
+    s = max(30, int(40 * scale))
+    cv = tk.Canvas(parent, width=s, height=s, bg='#1c1c1c', highlightthickness=0, bd=0)
+    pad = max(1, int(2 * scale))
+    cv.create_oval(pad, pad, s - pad, s - pad, fill='#e0b050', outline='')
+    cv.create_text(s / 2, s / 2 + scale, text='!', font=(FONT, 19, 'bold'), fill='#181818')
+    return cv
+
+
+def focus_self(win):
+    """显示后把键盘焦点拿到对话框，Enter/Esc 快捷键才生效"""
+    try:
+        if win.winfo_exists() and win.state() == 'normal':
+            win.focus_set()
+    except Exception:
+        pass
+
+
+class ConfirmDialog(ctk.CTkToplevel):
+    """深色确认框（替代系统 messagebox.askyesno，风格与主界面/关闭警告一致）。
+    result = True（确认）/ False（取消 / Esc / 关闭）。
+    Enter=取消（危险操作不由回车误触发）；确认钮为红色系。"""
+
+    def __init__(self, app, title, message, yes='确定', no='取消', danger=True, width=430):
+        super().__init__(app)
+        self.app = app
+        self.result = False
+        self.title(title)
+        self.resizable(False, False)
+        self.attributes('-topmost', True)
+        self.transient(app)
+        self.configure(fg_color='#181818')
+        self.withdraw()   # 先隐藏，定位后再显示
+
+        frm = ctk.CTkFrame(self, fg_color='#1c1c1c', corner_radius=0)
+        frm.pack(fill='both', expand=True, padx=2, pady=2)
+
+        head = ctk.CTkFrame(frm, fg_color='transparent')
+        head.pack(fill='x', padx=24, pady=(20, 10))
+        warn_icon(head).pack(side='left')
+        ctk.CTkLabel(head, text=title, font=ctk.CTkFont(FONT, 18, 'bold')).pack(side='left', padx=(14, 0))
+
+        ctk.CTkLabel(frm, text=message, justify='left', wraplength=width - 76,
+                     font=ctk.CTkFont(FONT, 13), text_color='#c8c8c8').pack(
+            anchor='w', padx=24, pady=(0, 18))
+
+        row = ctk.CTkFrame(frm, fg_color='transparent')
+        row.pack(fill='x', padx=24, pady=(0, 20))
+
+        picked = {'done': False}   # 防 Enter/点击双触发时对已销毁窗口二次 destroy
+
+        def pick(v):
+            if picked['done']:
+                return
+            picked['done'] = True
+            self.result = v
+            try:
+                self.destroy()
+            except Exception:
+                pass
+
+        # 视觉顺序 [确认(红)] [取消]：取消在最右，与关闭警告窗的按钮习惯一致
+        ctk.CTkButton(row, text=no, width=112, height=36,
+                      font=ctk.CTkFont(FONT, 14),
+                      fg_color='#2a2a2a', hover_color='#3a3a3a',
+                      command=lambda: pick(False)).pack(side='right', padx=(6, 0))
+        y_fg, y_hov = (C_RED, C_RED_H) if danger else (C_GREEN, C_GREEN_H)
+        ctk.CTkButton(row, text=yes, width=112, height=36,
+                      font=ctk.CTkFont(FONT, 14, 'bold'),
+                      fg_color=y_fg, hover_color=y_hov,
+                      command=lambda: pick(True)).pack(side='right')
+
+        self.bind('<Return>', lambda e: pick(False))
+        self.bind('<Escape>', lambda e: pick(False))
+        self.protocol('WM_DELETE_WINDOW', lambda: pick(False))   # 点确认框的 X = 取消
+
+        show_dialog_robust(self, app)   # 居中显示 + 防隐藏竞态 + 安全 grab
+        self.after(200, lambda: focus_self(self))
+        self.after(450, lambda: focus_self(self))
+
+
 class CloseWarnDialog(ctk.CTkToplevel):
     """关闭云档时的警告确认（深色界面风格，替代系统 messagebox）。
 
@@ -917,7 +1406,7 @@ class CloseWarnDialog(ctk.CTkToplevel):
         # 图标 + 标题（左对齐，与其他对话框一致）
         head = ctk.CTkFrame(frm, fg_color='transparent')
         head.pack(fill='x', padx=24, pady=(22, 10))
-        self._warn_icon(head).pack(side='left')
+        warn_icon(head).pack(side='left')
         ctk.CTkLabel(head, text=('游戏正在运行' if game else '正在同步'),
                      font=ctk.CTkFont(FONT, 18, 'bold')).pack(side='left', padx=(14, 0))
 
@@ -978,29 +1467,8 @@ class CloseWarnDialog(ctk.CTkToplevel):
         self.protocol('WM_DELETE_WINDOW', lambda: pick(None))   # 点警告窗的 X = 取消
 
         show_dialog_robust(self, app)   # 居中显示 + 防隐藏竞态 + 安全 grab
-        self.after(200, self._focus_self)
-        self.after(450, self._focus_self)
-
-    def _focus_self(self):
-        """显示后把键盘焦点拿到警告窗，Enter/Esc 快捷键才生效"""
-        try:
-            if self.winfo_exists() and self.state() == 'normal':
-                self.focus_set()
-        except Exception:
-            pass
-
-    def _warn_icon(self, parent):
-        """琥珀色圆形警示图标（Canvas 绘制，与“正在中止…”状态色一致，不依赖符号字体）"""
-        try:
-            scale = self._get_window_scaling()
-        except Exception:
-            scale = 1.0
-        s = max(30, int(40 * scale))
-        cv = tk.Canvas(parent, width=s, height=s, bg='#1c1c1c', highlightthickness=0, bd=0)
-        pad = max(1, int(2 * scale))
-        cv.create_oval(pad, pad, s - pad, s - pad, fill='#e0b050', outline='')
-        cv.create_text(s / 2, s / 2 + scale, text='!', font=(FONT, 19, 'bold'), fill='#181818')
-        return cv
+        self.after(200, lambda: focus_self(self))
+        self.after(450, lambda: focus_self(self))
 
 
 class GameEditor(ctk.CTkToplevel):
@@ -1051,47 +1519,93 @@ class GameEditor(ctk.CTkToplevel):
         self.e_process = self._row(frm, r, '等待进程（逗号/顿号分隔，空=自动跟踪进程树）')
         self.e_process.insert(0, '、'.join(g.get('process', [])))
         r += 1
-        self.e_keep = self._row(frm, r, '备份/快照保留份数（0=不清理）')
-        self.e_keep.insert(0, str(g.get('backup_keep', self.app.cfg['backup_keep'] if self.app.cfg else 10)))
+
+        # 启动方式（v2.5.1）：直启句柄环境敏感的程序（部分 .NET 程序启动即崩）
+        # 或 .lnk/需提权的游戏选 Shell（等价双击语义）。仅收录游戏同样适用。
+        ctk.CTkLabel(frm, text='启动方式', font=ctk.CTkFont(FONT, 13), text_color='#9a9a9a').grid(
+            row=r, column=0, sticky='w', pady=(10, 0))
+        lw_row = ctk.CTkFrame(frm, fg_color='transparent')
+        lw_row.grid(row=r, column=1, sticky='w', pady=(10, 0))
+        self.seg_launch = ctk.CTkSegmentedButton(lw_row, values=['直接启动', 'Shell 启动'])
+        self.seg_launch.set('Shell 启动' if g.get('launch') == 'shell' else '直接启动')
+        self.seg_launch.pack(side='left')
+        ctk.CTkLabel(lw_row, text='Shell=等价双击；直启即退的程序换它试',
+                     font=ctk.CTkFont(FONT, 11), text_color='#6a6a6a').pack(side='left', padx=(10, 0))
         r += 1
+
+        # 存档同步开关（个别游戏不需要同步，仅收录进游戏库）
+        ctk.CTkLabel(frm, text='存档同步', font=ctk.CTkFont(FONT, 13), text_color='#9a9a9a').grid(
+            row=r, column=0, sticky='w', pady=(10, 0))
+        sw_row = ctk.CTkFrame(frm, fg_color='transparent')
+        sw_row.grid(row=r, column=1, sticky='w', pady=(10, 0))
+        self.sw_sync = ctk.CTkSwitch(sw_row, text='启用存档同步', font=ctk.CTkFont(FONT, 12),
+                                     progress_color=C_GREEN, command=self._on_sync_toggle)
+        self.sw_sync.pack(side='left')
+        ctk.CTkLabel(sw_row, text='关闭 = 仅收录（可启动与计时，不同步存档）',
+                     font=ctk.CTkFont(FONT, 11), text_color='#6a6a6a').pack(side='left', padx=(10, 0))
+        r += 1
+
+        # 同步配置区：开关关闭时整体隐藏
+        self.sync_zone = ctk.CTkFrame(frm, fg_color='transparent')
+        self.sync_zone.grid(row=r, column=0, columnspan=2, sticky='ew')
+        r += 1
+        zr = 0
+        self.e_keep = self._row(self.sync_zone, zr, '备份/快照保留份数（0=不清理）')
+        self.e_keep.insert(0, str(g.get('backup_keep', self.app.cfg['backup_keep'] if self.app.cfg else 10)))
+        zr += 1
 
         # 模式
-        ctk.CTkLabel(frm, text='同步模式', font=ctk.CTkFont(FONT, 13), text_color='#9a9a9a').grid(
-            row=r, column=0, sticky='w', pady=(8, 2))
+        ctk.CTkLabel(self.sync_zone, text='同步模式', font=ctk.CTkFont(FONT, 13), text_color='#9a9a9a').grid(
+            row=zr, column=0, sticky='w', pady=(8, 2))
         self.seg_mode = ctk.CTkSegmentedButton(
-            frm, values=['时间戳', '镜像', '归档'],
+            self.sync_zone, values=['时间戳', '镜像', '归档'],
             command=self._on_mode)
         self.seg_mode.set(MODE_LABELS.get(g.get('mode', 'timestamp'), '时间戳'))
-        self.seg_mode.grid(row=r, column=1, sticky='w', pady=(8, 2))
-        self.lbl_mode_tip = ctk.CTkLabel(frm, text='', font=ctk.CTkFont(FONT, 11), text_color='#7a8a7a',
+        self.seg_mode.grid(row=zr, column=1, sticky='w', pady=(8, 2))
+        self.lbl_mode_tip = ctk.CTkLabel(self.sync_zone, text='', font=ctk.CTkFont(FONT, 11), text_color='#7a8a7a',
                                          justify='left')
-        self.lbl_mode_tip.grid(row=r + 1, column=1, sticky='w')
+        self.lbl_mode_tip.grid(row=zr + 1, column=1, sticky='w')
         self._on_mode(self.seg_mode.get())
-        r += 2
+        zr += 2
 
         # 目录对
-        ctk.CTkLabel(frm, text='目录对（本地 ↔ 网络）', font=ctk.CTkFont(FONT, 13),
-                     text_color='#9a9a9a').grid(row=r, column=0, sticky='w', pady=(6, 2))
-        ctk.CTkButton(frm, text='+ 添加目录对', width=110, height=28, fg_color='#232323',
+        ctk.CTkLabel(self.sync_zone, text='目录对（本地 ↔ 网络）', font=ctk.CTkFont(FONT, 13),
+                     text_color='#9a9a9a').grid(row=zr, column=0, sticky='w', pady=(6, 2))
+        ctk.CTkButton(self.sync_zone, text='+ 添加目录对', width=110, height=28, fg_color='#232323',
                       hover_color='#333333', command=lambda: self._add_pair('', '')).grid(
-            row=r, column=1, sticky='e', pady=(6, 2))
-        r += 1
+            row=zr, column=1, sticky='e', pady=(6, 2))
+        zr += 1
         # 普通容器、高度随内容自适应（外层表单本身可滚动，无需内嵌滚动区）
-        self.pairs_frame = ctk.CTkFrame(frm, fg_color='#141414', corner_radius=8)
-        self.pairs_frame.grid(row=r, column=0, columnspan=2, sticky='ew')
+        self.pairs_frame = ctk.CTkFrame(self.sync_zone, fg_color='#141414', corner_radius=8)
+        self.pairs_frame.grid(row=zr, column=0, columnspan=2, sticky='ew')
         self.pair_rows = []
         for p in (g.get('sync') or [{'local': '', 'net': ''}]):
             self._add_pair(p.get('local', ''), p.get('net', ''))
-        r += 1
+        zr += 1
 
         # 排除
-        ctk.CTkLabel(frm, text='排除规则（每行一条，如 *.tmp / shadercache/）', font=ctk.CTkFont(FONT, 13),
-                     text_color='#9a9a9a').grid(row=r, column=0, sticky='w', pady=(8, 2))
-        r += 1
-        self.txt_exclude = ctk.CTkTextbox(frm, height=68, font=ctk.CTkFont(FONT, 12), fg_color='#0d0d0d')
-        self.txt_exclude.grid(row=r, column=0, columnspan=2, sticky='ew')
+        ctk.CTkLabel(self.sync_zone, text='排除规则（每行一条，如 *.tmp / shadercache/）', font=ctk.CTkFont(FONT, 13),
+                     text_color='#9a9a9a').grid(row=zr, column=0, sticky='w', pady=(8, 2))
+        zr += 1
+        self.txt_exclude = ctk.CTkTextbox(self.sync_zone, height=68, font=ctk.CTkFont(FONT, 12), fg_color='#0d0d0d')
+        self.txt_exclude.grid(row=zr, column=0, columnspan=2, sticky='ew')
         self.txt_exclude.insert('1.0', '\n'.join(g.get('exclude', [])))
+
+        # “仅收录”提示条（开关关闭时显示）
+        self.lbl_nosync = ctk.CTkLabel(
+            frm, text='该游戏仅收录进游戏库：可从启动器启动游戏并统计时长，\n'
+                      '不参与存档同步（云档不会读写其存档文件）。\n'
+                      '已填写的目录对会保留在配置中，重新开启开关即可恢复。',
+            font=ctk.CTkFont(FONT, 12), text_color='#8a8a8a', justify='left')
+        self.lbl_nosync.grid(row=r, column=0, columnspan=2, sticky='w', padx=(6, 0), pady=(4, 0))
         r += 1
+
+        # 初始开关状态（仅收录游戏默认关闭）
+        if g.get('nosync'):
+            self.sw_sync.deselect()
+        else:
+            self.sw_sync.select()
+        self._on_sync_toggle()
 
         # 底部按钮栏：固定在窗口底部，不随表单滚动
         footer = ctk.CTkFrame(self, fg_color='transparent', height=56)
@@ -1160,6 +1674,18 @@ class GameEditor(ctk.CTkToplevel):
             '归档': '网络端保存 zip 快照（按份数保留），启动时恢复最新',
         }
         self.lbl_mode_tip.configure(text=tips.get(value, ''))
+
+    def _on_sync_toggle(self):
+        """存档同步开关：关闭时隐藏同步配置区并显示“仅收录”说明，开启时恢复"""
+        try:
+            if self.sw_sync.get():
+                self.sync_zone.grid()
+                self.lbl_nosync.grid_remove()
+            else:
+                self.sync_zone.grid_remove()
+                self.lbl_nosync.grid()
+        except Exception:
+            pass   # 构建早期 command 触发时不处理
 
     # ---- 图标 → 封面 ----
     def _covers_dir(self):
@@ -1245,13 +1771,17 @@ class GameEditor(ctk.CTkToplevel):
         if not name:
             messagebox.showwarning('校验', '游戏名称不能为空。', parent=self)
             return
+        nosync = not self.sw_sync.get()
+        # 目录对始终收集（“仅收录”时保留在配置里不生效，重新开启开关即恢复，
+        # 避免误关开关→保存→目录对配置丢失）
         pairs = []
         for pr in self.pair_rows:
             loc, net = engine.norm_dir(pr['local'].get()), engine.norm_dir(pr['net'].get())
             if loc or net:
                 pairs.append({'local': loc, 'net': net})
-        if not pairs or any(not p['local'] or not p['net'] for p in pairs):
-            messagebox.showwarning('校验', '至少需要一个完整的目录对（本地与网络目录都要填写）。', parent=self)
+        if not nosync and (not pairs or any(not p['local'] or not p['net'] for p in pairs)):
+            messagebox.showwarning('校验', '至少需要一个完整的目录对（本地与网络目录都要填写）。\n'
+                                          '或关闭“启用存档同步”，仅收录进游戏库。', parent=self)
             return
         try:
             keep = int(self.e_keep.get().strip() or '10')
@@ -1274,6 +1804,8 @@ class GameEditor(ctk.CTkToplevel):
             'exclude': [l.strip() for l in self.txt_exclude.get('1.0', 'end').splitlines() if l.strip()],
             'backup_keep': max(0, keep),
             'cover': self.e_cover.get().strip().strip('"'),
+            'nosync': nosync,
+            'launch': 'shell' if self.seg_launch.get() == 'Shell 启动' else 'direct',
             'sync': pairs,
         }
         if self.app.apply_game(gd, self.index):
@@ -1384,6 +1916,29 @@ class StatsDialog(ctk.CTkToplevel):
 # ----------------------------------------------------------------------------
 # 入口
 # ----------------------------------------------------------------------------
+def _crash_report():
+    """窗口版无控制台：未预期异常写入 云档崩溃.log（避免静默消失、无从排查）。
+    --smoke 自检模式下不弹系统对话框（无人值守）。"""
+    tb = traceback.format_exc()
+    try:
+        engine.LOG.exception('未预期的异常（GUI 入口）')
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(engine.APP_DIR, '云档崩溃.log'), 'a', encoding='utf-8') as f:
+            from datetime import datetime
+            f.write(f'---- {datetime.now().isoformat(timespec="seconds")} v{engine.VERSION} ----\n{tb}\n')
+    except OSError:
+        pass
+    if os.name == 'nt' and '--smoke' not in sys.argv:
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                None, '程序遇到未预期的错误，即将退出。\n详情见程序目录下的 云档崩溃.log',
+                '云档启动器', 0x10)
+        except Exception:
+            pass
+
+
 def main():
     if sys.stdout is None:
         sys.stdout = open(os.devnull, 'w', encoding='utf-8')
@@ -1428,4 +1983,10 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        _crash_report()
+        sys.exit(1)

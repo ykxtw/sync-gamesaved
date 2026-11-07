@@ -11,5 +11,5 @@ args = '-n 2 127.0.0.1'
 mode = 'archive'
 backup_keep = 2
 sync = [
-  { local = 'C:\Users\HC\.zcode\workspace\c7d3d2f8-915f-4575-870f-7549bedc0c96\云档\test\loc_a', net = 'C:\Users\HC\.zcode\workspace\c7d3d2f8-915f-4575-870f-7549bedc0c96\云档\test\net_a' },
+  { local = '/home/z/my-project/sync-gamesaved/test\loc_a', net = '/home/z/my-project/sync-gamesaved/test\net_a' },
 ]

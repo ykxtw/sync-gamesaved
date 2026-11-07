@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 
-BASE = r'C:\Users\HC\.zcode\workspace\c7d3d2f8-915f-4575-870f-7549bedc0c96\云档'
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # 自动定位源码根目录
 sys.path.insert(0, BASE)
 import 云档 as engine  # noqa: E402
 

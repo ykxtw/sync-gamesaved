@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""关闭警告回归：深色警告窗（强制退出/最小化/取消）+ 三选路径 + 同步中强制关闭"""
+"""关闭警告回归：深色警告窗（强制退出/最小化/取消）+ 三选路径 + 同步中强制关闭。
+v2.5.0 起会话改为注册表模型：模拟会话用 make_sess() 注册 GameSession。"""
 import os
 import sys
 import time
@@ -40,6 +41,15 @@ def ask(mode):
     return answers.get(mode)
 
 
+def make_sess(gid, name, game_mode=True):
+    """注册一个模拟会话（v2.5.0：on_close 遍历 sessions 注册表）"""
+    s = gui.GameSession(gid, name, {'name': name, 'sync': []}, False, 'both')
+    if game_mode:
+        s.launch_time = time.time()
+    app.sessions[gid] = s
+    return s
+
+
 app._ask_close_choice = ask
 
 
@@ -62,9 +72,8 @@ def click_in(dlg, label):
 
 
 def s1():  # 游戏运行中 + 取消
-    app.running = True
-    app.control = engine.SessionControl()
-    app.launch_time = time.time()
+    app.sessions.clear()
+    make_sess('g1', '测试游戏')
     answers['game'] = None
     app.on_close()
     check('1 游戏运行中选取消：窗口保留', app.winfo_exists() and not app._pending_close
@@ -84,22 +93,40 @@ def s2():  # 游戏运行中 + 最小化继续等待
 
 
 def s3():  # 同步中 + 拒绝强制关闭
-    app.launch_time = None          # 模拟“恢复/推送阶段”（无游戏运行）
+    app.sessions['g1'].launch_time = None   # 模拟“恢复/推送阶段”（无游戏运行）
     answers['sync'] = None
     app.on_close()
     check('3 同步中选取消：窗口保留', app.winfo_exists() and not app._pending_close
           and calls['sync'] == 1, f"sync={calls['sync']}")
+    app.after(200, s3b)
+
+
+def s3b():  # v2.5.0 多会话：一个在游戏中 + 一个在同步 → 按 game 模式
+    app.sessions.clear()
+    make_sess('m1', '游戏一')
+    make_sess('m2', '游戏二', game_mode=False)   # 同步中
+    calls['game'] = 0
+    answers['game'] = None
+    app.on_close()
+    check('3b 多会话任一游戏在运行→game模式', calls['game'] == 1 and app.winfo_exists())
+    app.sessions.clear()
     app.after(200, s4)
 
 
 def s4():  # 真实警告窗（游戏模式）：Esc = 取消
-    app.launch_time = time.time()
+    app.sessions.clear()
+    make_sess('g1', '测试游戏')
     app._ask_close_choice = real_ask
 
     def poke():
         dlg = app._close_dlg
         if dlg is None or not dlg.winfo_exists():
             check('4a 警告窗已打开', False, 'no dlg')
+            return
+        # wine 下窗口映射较慢：等对话框可见且按钮完成布局（最多 ~4 秒）
+        btns = find_buttons(dlg)
+        if dlg.state() != 'normal' or not btns or not all(b.winfo_rootx() > 0 for b in btns):
+            app.after(200, poke)
             return
         captured['title'] = dlg.title()
         captured['state'] = dlg.state()
@@ -141,7 +168,8 @@ def s5():  # 真实警告窗：点「最小化」按钮
 
 
 def s6():  # 真实警告窗（同步模式）：点「取消」
-    app.launch_time = None
+    app.sessions.clear()
+    make_sess('g1', '测试游戏', game_mode=False)   # 同步中
 
     def poke():
         dlg = app._close_dlg
@@ -159,7 +187,10 @@ def s6():  # 真实警告窗（同步模式）：点「取消」
     app.after(200, s7)
 
 
-def s7():  # 真实警告窗（同步模式）：点「强制退出」→ 中止信号置位 → 会话干净退出后窗口销毁
+def s7():  # 真实警告窗（同步模式）：点「强制退出」→ 全部会话中止 → 干净退出后窗口销毁
+    app.sessions.clear()
+    make_sess('g1', '测试游戏', game_mode=False)
+    make_sess('g2', '另一游戏', game_mode=False)   # v2.5.0：两个会话同时强制退出
 
     def poke():
         dlg = app._close_dlg
@@ -168,23 +199,23 @@ def s7():  # 真实警告窗（同步模式）：点「强制退出」→ 中止
 
     app.after(700, poke)
     app.on_close()
-    ok = app._pending_close and app.control.abort.is_set()
-    check('7 同步中强制退出：中止信号已置位', ok)
-    # 模拟工作线程的 done 事件（引擎 finally 释放锁后发出）
-    app.running = False
-    app.q.put(('done', engine.EXIT_ABORT))
+    ok = app._pending_close and all(s.control.abort.is_set() for s in app.sessions.values())
+    check('7 强制退出：全部会话中止信号已置位', ok)
+    # 模拟工作线程的 done 事件（引擎 finally 释放锁后发出，按游戏ID逐个结束）
+    for gid in list(app.sessions):
+        app.q.put(('done', engine.EXIT_ABORT, gid))
     app.after(600, s8)
 
 
 def s8():
     destroyed = not app.winfo_exists()
-    check('8 会话退出后窗口自动销毁', destroyed)
+    check('8 全部会话退出后窗口自动销毁', destroyed)
     if not destroyed:
         app.destroy()
 
 
 app.after(600, s1)
-app.after(12000, lambda: (app.destroy()) if app.winfo_exists() else None)
+app.after(25000, lambda: (app.destroy()) if app.winfo_exists() else None)
 app.mainloop()
 
 print('====', 'ALL PASS' if all(results) else f'FAILED {results}', '====')

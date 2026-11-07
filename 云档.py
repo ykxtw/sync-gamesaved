@@ -64,7 +64,7 @@ except ImportError:
 # ----------------------------------------------------------------------------
 # 常量
 # ----------------------------------------------------------------------------
-VERSION = '2.3.3'
+VERSION = '2.5.2'
 
 EXIT_OK = 0
 EXIT_SYNC = 1
@@ -106,8 +106,30 @@ try:
 except Exception:
     pass
 
-# 会话运行期的活动桥接（GUI/CLI 各自实现），见 run_session
-_ACTIVE = {'reporter': None, 'control': None}
+# 会话运行期的活动桥接（GUI/CLI 各自实现），见 run_session。
+# v2.5.0 起改为线程本地：同一进程内多个游戏的会话并行时，各会话（各自工作线程）
+# 的 reporter/control 互不串线——旧版全局字典会被后启动的会话覆盖，导致
+# 前一个会话的日志路由错乱、中止信号互相干扰。
+class _ActiveLocal(threading.local):
+    def __init__(self):
+        self.reporter = None
+        self.control = None
+
+
+_ACTIVE = _ActiveLocal()
+
+
+# 当前会话的游戏名（锁信息展示用）。线程本地，理由同上。
+class _GameLocal(threading.local):
+    def __init__(self):
+        self.name = '?'
+
+
+_CURRENT = _GameLocal()
+
+
+def current_game():
+    return _CURRENT.name
 
 
 class SessionError(Exception):
@@ -121,7 +143,7 @@ class SessionError(Exception):
 
 def say(msg='', also_log=True):
     """输出一行：有活动 Reporter 时交给它（GUI），否则打印并写日志。"""
-    rep = _ACTIVE['reporter']
+    rep = _ACTIVE.reporter
     if rep is not None:
         rep.info(msg)
         return
@@ -132,21 +154,34 @@ def say(msg='', also_log=True):
 
 
 def notify_phase(name, detail=''):
-    rep = _ACTIVE['reporter']
+    rep = _ACTIVE.reporter
     if rep is not None:
         rep.phase(name, detail)
 
 
 def notify_event(name, data=None):
-    rep = _ACTIVE['reporter']
+    rep = _ACTIVE.reporter
     if rep is not None:
         rep.event(name, data)
 
 
 def _check_abort():
-    c = _ACTIVE['control']
+    c = _ACTIVE.control
     if c is not None and c.abort.is_set():
         raise SessionError('会话已中止（未执行推送）。', EXIT_ABORT)
+
+
+def _sleep_abortable(sec):
+    """会话内的可中止等待：中止信号到来立即打断并抛出；
+    无控制信号时（CLI 独立调用等）退化为普通 sleep。
+    修复：旧版所有等待点都是裸 time.sleep()，“网络目录不可达”等场景下
+    点「中止会话/强制退出」必须等满超时才能退出。"""
+    c = _ACTIVE.control
+    if c is not None:
+        if c.abort.wait(sec):
+            _check_abort()
+    else:
+        time.sleep(sec)
 
 
 class Reporter:
@@ -401,7 +436,8 @@ def _decode(b):
 
 
 def robocopy_run(src, dst, mode, exc):
-    """执行 robocopy，失败自动重试 2 次。返回 (rc, output)。rc<8 为成功。"""
+    """执行 robocopy，失败自动重试 2 次。返回 (rc, output)。rc<8 为成功。
+    中止信号：不再发起新的重试，等待中的重试间隔立即打断。"""
     cmd = ['robocopy', src, dst]
     cmd += ['/MIR'] if mode == 'mirror' else ['/E', '/XO']
     cmd += ['/FFT', '/COPY:DAT', '/DCOPY:T', '/R:1', '/W:1', '/XJ', '/NP', '/NDL', '/MT:8']
@@ -410,6 +446,7 @@ def robocopy_run(src, dst, mode, exc):
     attempts = 3
     rc, out = 16, ''
     for attempt in range(1, attempts + 1):
+        _check_abort()
         try:
             flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             p = subprocess.run(cmd, capture_output=True, creationflags=flags)
@@ -426,7 +463,7 @@ def robocopy_run(src, dst, mode, exc):
             return rc, out
         if attempt < attempts:
             say(f'  同步失败 (rc={rc})，5 秒后重试 ({attempt}/{attempts - 1})...')
-            time.sleep(5)
+            _sleep_abortable(5)
     return rc, out
 
 
@@ -636,7 +673,7 @@ def archive_push(pair, game, idx, exc, dry):
     ts = now_ts()
     final = os.path.join(net, f'{prefix}_{ts}.zip')
     while os.path.exists(final):        # 同一秒内重复推送：错开 1 秒，避免覆盖旧快照
-        time.sleep(1)
+        _sleep_abortable(1)
         ts = now_ts()
         final = os.path.join(net, f'{prefix}_{ts}.zip')
     tmp = final + '.tmp'
@@ -674,6 +711,11 @@ def archive_push(pair, game, idx, exc, dry):
 # 锁：跨机器互斥 + 本机单实例
 # ----------------------------------------------------------------------------
 class NetLock:
+    """跨机器互斥锁（网络目录内的锁目录）。
+    v2.5.0：多会话并行时，同一网络目录不允许被同一进程内两个会话同时使用
+    （否则恢复/推送会互相路踩）——通过进程内持锁登记表拒绝，不提供“强制接管”
+    （接管自己进程的活锁没有意义）；跨机器/跨进程冲突仍走用户确认。"""
+
     def __init__(self, net_dir):
         self.path = os.path.join(net_dir, LOCK_NAME)
 
@@ -683,6 +725,13 @@ class NetLock:
                 os.makedirs(self.path)  # 已存在则抛 FileExistsError
             except FileExistsError:
                 info = self._read() or {}
+                with _HELD_LOCKS_GUARD:
+                    held_in_process = self.path in _HELD_LOCKS
+                if held_in_process:
+                    say(f'[错误] 该网络目录正被本程序内另一个游戏的会话使用（[{info.get("game", "?")}]）:\n'
+                        f'  {self.path}\n'
+                        '  多个游戏共用同一网络目录时不能同时同步，请等那个会话结束（或先中止它）。')
+                    return False
                 # 本机遗留的陈旧锁（上次异常退出、pid 已死）→ 自动清理，不打扰
                 if info.get('computer') == socket.gethostname() and self._local_pid_dead(info):
                     say(f'[提示] 检测到本机上次异常退出遗留的同步锁（pid {info.get("pid", "?")} 已不存在），自动清理。')
@@ -704,7 +753,7 @@ class NetLock:
                 'computer': socket.gethostname(),
                 'user': os.environ.get('USERNAME', ''),
                 'pid': os.getpid(),
-                'game': CURRENT_GAME,
+                'game': current_game(),
                 'time': datetime.now().isoformat(timespec='seconds'),
             }
             try:
@@ -712,6 +761,8 @@ class NetLock:
                     json.dump(info, f, ensure_ascii=False)
             except OSError:
                 pass
+            with _HELD_LOCKS_GUARD:
+                _HELD_LOCKS.add(self.path)
             return True
         say('[错误] 无法获取同步锁。')
         return False
@@ -756,11 +807,17 @@ class NetLock:
             except OSError as e:
                 last_err = e
                 try:  # 清只读属性后重试
-                    os.chmod(self.path, stat.S_IWRITE)
+                    # Windows：S_IWRITE=去掉只读属性；POSIX(Linux/wine测试)：目录需保持
+                    # 可遍历（0o700），否则 S_IWRITE(0o200) 会让 rmtree 无法进入目录
+                    if os.name == 'nt':
+                        dmode = fmode = stat.S_IWRITE
+                    else:
+                        dmode, fmode = 0o700, 0o600
+                    os.chmod(self.path, dmode)
                     for dp, _dns, fns in os.walk(self.path):
-                        os.chmod(dp, stat.S_IWRITE)
+                        os.chmod(dp, dmode)
                         for n in fns:
-                            os.chmod(os.path.join(dp, n), stat.S_IWRITE)
+                            os.chmod(os.path.join(dp, n), fmode)
                 except OSError:
                     pass
                 time.sleep(1)
@@ -787,7 +844,14 @@ class NetLock:
             return None
 
     def release(self):
+        with _HELD_LOCKS_GUARD:
+            _HELD_LOCKS.discard(self.path)
         shutil.rmtree(self.path, ignore_errors=True)
+
+
+# 本进程内各会话已持有的网络锁目录（多会话并行时拒绝同目录复用）
+_HELD_LOCKS = set()
+_HELD_LOCKS_GUARD = threading.Lock()
 
 
 _local_guard_path = None
@@ -853,40 +917,51 @@ def find_running(names):
     if not want:
         return []
     hits = []
-    for p in psutil.process_iter(['name']):
-        try:
-            nm = (p.info.get('name') or '').lower()
-            if nm in want:
-                hits.append(nm)
-        except psutil.Error:
-            pass
+    # 防御：psutil 枚举过程中恰有进程退出时可能抛出非 psutil.Error 的
+    # OSError（wine 下高频复现；Windows 上理论也存在）。
+    # 宁可漏检（视为无命中）也不能让整个会话崩溃。
+    try:
+        for p in psutil.process_iter(['name']):
+            try:
+                nm = (p.info.get('name') or '').lower()
+                if nm in want:
+                    hits.append(nm)
+            except Exception:
+                pass
+    except Exception as e:
+        LOG.warning('进程枚举异常（%s），跳过已运行检测', e)
     return hits
 
 
 def count_named(names):
     want = {n.lower() for n in names if n}
     c = 0
-    for p in psutil.process_iter(['name']):
-        try:
-            if (p.info.get('name') or '').lower() in want:
-                c += 1
-        except psutil.Error:
-            pass
+    try:
+        for p in psutil.process_iter(['name']):
+            try:
+                if (p.info.get('name') or '').lower() in want:
+                    c += 1
+            except Exception:
+                pass
+    except Exception as e:
+        LOG.warning('进程枚举异常（%s），本轮按未检出处理', e)
     return c
 
 
 def wait_for_start(names, timeout):
-    """返回 'started' | 'timeout' | 'stopped'（用户请求提前结束）"""
+    """返回 'started' | 'timeout' | 'stopped'（用户请求提前结束）。
+    中止信号会立即抛出 SessionError（旧版要等进程出现或超时才生效）。"""
     t0 = time.time()
     while True:
+        _check_abort()
         if count_named(names) > 0:
             return 'started'
-        c = _ACTIVE['control']
+        c = _ACTIVE.control
         if c is not None and c.stop_wait.is_set():
             return 'stopped'
         if time.time() - t0 >= timeout:
             return 'timeout'
-        time.sleep(POLL_SEC)
+        _sleep_abortable(POLL_SEC)
         el = int(time.time() - t0)
         if el % 15 == 0 and el > 0:
             say(f'  ... 等待进程出现已 {el} 秒')
@@ -896,10 +971,10 @@ def wait_for_exit_names(names):
     last_hb = time.time()
     while count_named(names) > 0:
         _check_abort()
-        c = _ACTIVE['control']
+        c = _ACTIVE.control
         if c is not None and c.stop_wait.is_set():
             return
-        time.sleep(POLL_SEC)
+        _sleep_abortable(POLL_SEC)
         if time.time() - last_hb >= 3600:
             last_hb = time.time()
             LOG.info('仍在等待进程退出: %s', ', '.join(names))
@@ -912,14 +987,18 @@ def wait_for_exit_tree(root_pid):
     tracked = {root_pid}
     while tracked:
         _check_abort()
-        c = _ACTIVE['control']
+        c = _ACTIVE.control
         if c is not None and c.stop_wait.is_set():
             return False
-        time.sleep(POLL_SEC)
+        _sleep_abortable(POLL_SEC)
         still = set()
         for pid in tracked:
             try:
                 p = psutil.Process(pid)
+                # POSIX（Linux/wine 测试环境）：子进程退出后若暂未收割呈僵尸态，
+                # 视为已退出（Windows 无僵尸机制，此分支不会命中）
+                if p.status() == psutil.STATUS_ZOMBIE:
+                    raise psutil.NoSuchProcess(pid)
                 still.add(pid)
                 try:
                     still.update(c2.pid for c2 in p.children(recursive=False))
@@ -956,6 +1035,27 @@ def split_args(s):
     return out
 
 
+def shell_launch(exe, argsl, workdir):
+    """v2.5.1：Shell 方式启动（与双击/资源管理器同语义）。
+    适用：.lnk 快捷方式、需要管理员权限（弹 UAC）、以及对直启句柄环境敏感的
+    程序（典型：部分 .NET 程序在继承无效标准句柄时启动即崩，事件日志
+    0xE0434352）。返回 True；失败抛 OSError。
+    非 Windows（测试环境）下无 ShellExecute，退化为 DEVNULL 直启以便回归覆盖。"""
+    if os.name == 'nt':
+        import ctypes
+        params = subprocess.list2cmdline(argsl) if argsl else None
+        wd = (workdir or '').strip() or None
+        rc = ctypes.windll.shell32.ShellExecuteW(None, 'open', exe, params, wd, 1)  # 1=SW_SHOWNORMAL
+        if rc <= 32:   # ShellExecute 返回 >32 才算成功
+            raise OSError(f'ShellExecuteW 返回 {rc}')
+        return True
+    # POSIX 测试环境：退化直接启动
+    subprocess.Popen([exe] + argsl, cwd=(workdir or '').strip() or None,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+    return True
+
+
 def launch_game(game, dry):
     """返回 ('tree', pid) | ('names', [进程名]) | None(dry) | 'FAIL'"""
     exe = game['exe']
@@ -965,16 +1065,32 @@ def launch_game(game, dry):
     say(f'启动程序: {exe}')
     workdir = game.get('workdir') or os.path.dirname(exe) or '.'
     argsl = split_args(game.get('args'))
+    # v2.5.1：launch='shell' 显式选 Shell 方式；.lnk 只能走 Shell（直启 CreateProcess 不认）
+    if (game.get('launch') or 'direct') == 'shell' or exe.lower().endswith('.lnk'):
+        say('  启动方式：Shell（等价双击语义）。')
+        try:
+            shell_launch(exe, argsl, workdir)
+        except OSError as e:
+            say(f'  [错误] 无法启动: {e}')
+            return 'FAIL'
+        names = list(game.get('process') or []) or [os.path.basename(exe)]
+        return ('names', names)
     flags = 0
     if os.name == 'nt':
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        # v2.5.1 修复：去掉 DETACHED_PROCESS。原直启继承父进程（无控制台打包）的
+        # 无效标准句柄值，部分 .NET 程序（如 Ryujinx 1.3.3）在运行时初始化 Console
+        # 时抛未处理异常，启动即崩（应用程序错误 0xE0434352，KERNELBASE.dll）。
+        # 现标准三句柄显式指向 DEVNULL（有效设备），等价 cmd start 的句柄环境。
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP
     try:
-        p = subprocess.Popen([exe] + argsl, cwd=workdir, creationflags=flags)
+        p = subprocess.Popen([exe] + argsl, cwd=workdir, creationflags=flags,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
         return ('tree', p.pid)
     except OSError as e:
-        say(f'  直接启动失败 ({e})，改用资源管理器方式启动（可能弹出 UAC 提权窗口）...')
+        say(f'  直接启动失败 ({e})，改用 Shell 方式启动（可能弹出 UAC 提权窗口）...')
         try:
-            os.startfile(exe)  # ShellExecute：兼容 .lnk 与需管理员权限的程序
+            shell_launch(exe, argsl, workdir)
             names = list(game.get('process') or []) or [os.path.basename(exe)]
             return ('names', names)
         except OSError as e2:
@@ -992,7 +1108,8 @@ def append_stats(csv_path, game, start_dt, end_dt):
     minutes = max(0, int((end_dt - start_dt).total_seconds() // 60))
     newfile = not os.path.isfile(csv_path)
     try:
-        with open(csv_path, 'a', encoding='utf-8-sig', newline='') as f:
+        # 多会话并行时可能同时收尾写统计：串行化，避免两个线程同时建表头/交错写入
+        with _STATS_LOCK, open(csv_path, 'a', encoding='utf-8-sig', newline='') as f:
             w = csv.writer(f)
             if newfile:
                 w.writerow(STATS_HEADER)
@@ -1001,6 +1118,9 @@ def append_stats(csv_path, game, start_dt, end_dt):
     except OSError as e:
         LOG.warning('写统计失败: %s', e)
     return minutes
+
+
+_STATS_LOCK = threading.Lock()
 
 
 def load_stats(csv_path):
@@ -1241,6 +1361,35 @@ def _cfg_str_list(value, key=''):
     return []
 
 
+def _cfg_launch(value):
+    """v2.5.1：启动方式容错读取。'shell' = Shell 启动（等价双击）；其余一律 direct。"""
+    s = str(value or '').strip().lower()
+    if s == 'shell':
+        return 'shell'
+    if s not in ('', 'direct'):
+        LOG.warning('配置 launch 应为 direct/shell，收到 %r，按 direct 处理', value)
+    return 'direct'
+
+
+def _cfg_bool(value, key=''):
+    """容错读取布尔配置：TOML 原生 true/false 之外，手写的
+    'yes'/'on'/'1'/True 等也按 true；无法识别的按 false 并留痕。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ('1', 'true', 'yes', 'on', 'y', '是'):
+            return True
+        if s in ('', '0', 'false', 'no', 'off', 'n', '否'):
+            return False
+    LOG.warning('配置项 %s 应为布尔值，收到 %r，按 false 处理', key, value)
+    return False
+
+
 def normalize_config(data):
     g = data.get('general') or {}
     if not isinstance(g, dict):
@@ -1286,6 +1435,8 @@ def normalize_config(data):
             'backup_keep': _cfg_int(gd.get('backup_keep', cfg['backup_keep']),
                                     cfg['backup_keep'], 'game.backup_keep'),
             'cover': str(gd.get('cover') or ''),
+            'nosync': _cfg_bool(gd.get('nosync'), 'game.nosync'),
+            'launch': _cfg_launch(gd.get('launch')),
             'sync': pairs,
         })
     return cfg
@@ -1297,6 +1448,9 @@ def validate_config(cfg):
         n = g['name']
         if g['mode'] not in MODES:
             errs.append(f'[{n}] mode 必须是 {"/".join(MODES)}，当前为 {g["mode"]!r}')
+        if g.get('nosync'):
+            # 仅收录：不参与存档同步，无目录对可校验
+            continue
         if not g['sync']:
             errs.append(f'[{n}] 未配置 sync 目录对。')
         for i, p in enumerate(g['sync'], 1):
@@ -1377,16 +1531,23 @@ def save_toml(path, cfg):
         if g.get('process'):
             L.append('process = [' + ', '.join(_q(x) for x in g['process']) + ']')
         L.append(f'mode = {_q(g["mode"])}')
+        if g.get('nosync'):
+            L.append('nosync = true   # 仅收录：不参与存档同步')
+        if g.get('launch') == 'shell':
+            L.append('launch = \'shell\'   # Shell 启动：等价双击语义（疑难游戏用）')
         if g.get('cover'):
             L.append(f'cover = {_q(g["cover"])}')
         if g.get('exclude'):
             L.append('exclude = [' + ', '.join(_q(x) for x in g['exclude']) + ']')
         if g.get('backup_keep') != cfg['backup_keep']:
             L.append(f'backup_keep = {g["backup_keep"]}')
-        L.append('sync = [')
-        for p in g['sync']:
-            L.append(f'  {{ local = {_q(p["local"])}, net = {_q(p["net"])} }},')
-        L.append(']')
+        if g['sync']:
+            L.append('sync = [')
+            for p in g['sync']:
+                L.append(f'  {{ local = {_q(p["local"])}, net = {_q(p["net"])} }},')
+            L.append(']')
+        else:
+            L.append('sync = []')
         L.append('')
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(L))
@@ -1484,6 +1645,13 @@ def wizard(path):
 # ----------------------------------------------------------------------------
 # 游戏选择
 # ----------------------------------------------------------------------------
+def game_label(g):
+    """游戏展示标签：仅收录游戏标注“不同步”，其余显示同步模式"""
+    if g.get('nosync'):
+        return '不同步'
+    return MODE_LABEL.get(g['mode'], g['mode'])
+
+
 def choose_game(cfg, want):
     games = cfg['games']
     if want:
@@ -1500,7 +1668,7 @@ def choose_game(cfg, want):
         say('')
         say('请选择要启动的游戏：')
         for i, g in enumerate(games, 1):
-            say(f'  {i}. {g["name"]}  [{MODE_LABEL.get(g["mode"], g["mode"])}]  ({g["exe"] or "仅同步"})')
+            say(f'  {i}. {g["name"]}  [{game_label(g)}]  ({g["exe"] or "仅同步"})')
         say('  q. 退出')
         s = ask('输入编号: ')
         if s is None:
@@ -1519,22 +1687,28 @@ def list_games(cfg):
     say('')
     say(f'== 已配置 {len(cfg["games"])} 个游戏 ==')
     for i, g in enumerate(cfg['games'], 1):
-        say(f'  {i}. {g["name"]}  [{MODE_LABEL.get(g["mode"], g["mode"])}]')
+        say(f'  {i}. {g["name"]}  [{game_label(g)}]')
         say(f'     程序: {g["exe"] or "（仅同步）"}')
-        for p in g['sync']:
-            say(f'     {p["local"]}')
-            say(f'      ↔ {p["net"]}')
+        if g.get('nosync'):
+            say('     存档同步: 未启用（仅收录）')
+        else:
+            for p in g['sync']:
+                say(f'     {p["local"]}')
+                say(f'      ↔ {p["net"]}')
 
 
 # ----------------------------------------------------------------------------
 # 会话主流程
 # ----------------------------------------------------------------------------
-CURRENT_GAME = '?'
+# 当前会话的游戏名已改为线程本地（见文件头部 _CURRENT / current_game()），
+# 多会话并行时各自独立，互不覆盖。
 
 
 def precheck(cfg, game, launching, dry, bridge):
+    # 仅收录游戏不碰目录对（即便手工编辑时保留了 sync 列表）
+    pairs = [] if game.get('nosync') else game['sync']
     # 1) 目录检查与网络可达性
-    for i, pair in enumerate(game['sync'], 1):
+    for i, pair in enumerate(pairs, 1):
         loc, net = pair['local'], pair['net']
         if not os.path.isdir(loc):
             if dry:
@@ -1555,11 +1729,12 @@ def precheck(cfg, game, launching, dry, bridge):
             continue
         t0 = time.time()
         while not os.path.isdir(net):
+            _check_abort()   # 中止/强制退出即时生效，不再等满 net_wait 秒
             waited = int(time.time() - t0)
             if waited >= cfg['net_wait']:
                 raise SessionError(f'网络目录不可达（已等待 {waited} 秒）: {net}', EXIT_PRECHECK)
             say(f'[预检] 网络目录暂不可达，{cfg["net_wait"]} 秒内重试... ({waited}s)')
-            time.sleep(3)
+            _sleep_abortable(3)
     # 2) 目标进程已在运行？
     if not dry:
         names = list(game.get('process') or [])
@@ -1569,7 +1744,7 @@ def precheck(cfg, game, launching, dry, bridge):
         if hits:
             raise SessionError(f'检测到 {",".join(sorted(set(hits)))} 已在运行，请先退出再运行本程序。', EXIT_PRECHECK)
     # 3) 磁盘空间
-    for i, pair in enumerate(game['sync'], 1):
+    for i, pair in enumerate(pairs, 1):
         loc = pair['local']
         drive = os.path.splitdrive(os.path.abspath(loc))[0] + os.sep
         try:
@@ -1592,23 +1767,29 @@ def run_session(cfg, game, dry_run=False, sync_only=False, bridge=None, control=
     - control: 取消/中止信号（缺省 None=不可取消）
     - reporter: 输出桥（缺省 None=打印+写日志）
     - direction: 'both'=恢复+推送（默认，可启动游戏）；'down'=仅恢复（网络→本地）；'up'=仅推送（本地→网络）
+
+    v2.5.0：会话内桥接（reporter/control/当前游戏名）均为线程本地存储，
+    同一进程内可为多个游戏并行调用（各自线程），互不串线。
+    同一网络目录的并发访问由 NetLock 的进程内登记表拒绝。
     """
-    global CURRENT_GAME
-    CURRENT_GAME = game['name']
+    _CURRENT.name = game['name']
     if bridge is None:
         bridge = ConsoleBridge()
-    prev_active = dict(_ACTIVE)
-    _ACTIVE['reporter'] = reporter
-    _ACTIVE['control'] = control
+    prev_reporter, prev_control = _ACTIVE.reporter, _ACTIVE.control
+    _ACTIVE.reporter = reporter
+    _ACTIVE.control = control
     try:
         return _session_body(cfg, game, dry_run, (not sync_only) and direction == 'both', bridge, direction)
     finally:
-        _ACTIVE.update(prev_active)
+        _ACTIVE.reporter, _ACTIVE.control = prev_reporter, prev_control
 
 
 def _session_body(cfg, game, dry, launching, bridge, direction='both'):
     code = EXIT_OK
 
+    if game.get('nosync') and not launching:
+        # 仅收录游戏：只能“开始游戏”（启动+计时），无同步可做
+        raise SessionError('该游戏未启用存档同步（仅收录），无法执行同步操作。', EXIT_CONFIG)
     if launching and not game['exe'] and not dry:
         raise SessionError('该游戏未配置 exe，无法启动。如只需同步请使用仅同步模式。', EXIT_CONFIG)
     if launching and not dry and game['exe'].lower().endswith('.lnk') and not game.get('process'):
@@ -1625,12 +1806,15 @@ def _session_body(cfg, game, dry, launching, bridge, direction='both'):
     say('')
     say('== 预检 ==')
     precheck(cfg, game, launching, dry, bridge)
-    say('  通过。')
+    if game.get('nosync'):
+        say('  通过。[仅收录] 未启用存档同步，本次只启动游戏与统计时长。')
+    else:
+        say('  通过。')
     _check_abort()
 
     # ---- 跨机器互斥锁 ----
     lock = None
-    if not dry:
+    if not dry and game['sync'] and not game.get('nosync'):
         lock = NetLock(game['sync'][0]['net'])
         notify_phase('锁定')
         say('')
@@ -1642,7 +1826,7 @@ def _session_body(cfg, game, dry, launching, bridge, direction='both'):
     try:
         eff = game['mode']
         # ---- 镜像模式：会话标记检查 ----
-        if eff == 'mirror':
+        if eff == 'mirror' and game['sync'] and not game.get('nosync'):
             missing = [p['net'] for p in game['sync'] if not has_marker(p['net'])]
             real_missing = []
             for net_dir in missing:
@@ -1671,7 +1855,7 @@ def _session_body(cfg, game, dry, launching, bridge, direction='both'):
         # ---- 恢复阶段（down / both）----
         exc = make_exclude(game)
         ok = True
-        if direction in ('both', 'down'):
+        if direction in ('both', 'down') and game['sync'] and not game.get('nosync'):
             notify_phase('恢复', MODE_LABEL.get(eff, eff))
             say('')
             say('=' * 46)
@@ -1720,7 +1904,8 @@ def _session_body(cfg, game, dry, launching, bridge, direction='both'):
                     notify_phase('等待退出')
                     quick = wait_for_exit_tree(r[1])
                     if quick:
-                        say('  [提示] 进程树很快退出——若游戏实际未运行，请检查 exe/参数。')
+                        say('  [提示] 进程树很快退出——若游戏实际未运行：检查 exe/启动参数，')
+                        say('         或在「编辑 → 启动方式」改为 Shell 启动（等价双击语义，疑难游戏可用）。')
                 else:
                     names = r[1]
                     say(f'  等待 {"、".join(names)} 启动（超时 {cfg["timeout_launch"]} 秒）...')
@@ -1740,7 +1925,7 @@ def _session_body(cfg, game, dry, launching, bridge, direction='both'):
                 say(f'  程序已退出（{start_dt.strftime("%H:%M")} ~ {end_dt.strftime("%H:%M")}）。')
 
         # ---- 推送阶段（up / both）----
-        if direction in ('both', 'up'):
+        if direction in ('both', 'up') and game['sync'] and not game.get('nosync'):
             _check_abort()
             notify_phase('推送')
             ok = True
